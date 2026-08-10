@@ -1,0 +1,13 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "harminpos",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-10",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "harminpos-db",
+      "database_id": "efd33694-2caf-41bf-ac85-216133a4adb0"
+    }
+  ]
+}
