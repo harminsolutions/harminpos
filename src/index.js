@@ -16,6 +16,28 @@ function jsonResponse(data, status = 200) {
   });
 }
 
+// Rough, dependency-free guess at "Browser on OS" from the User-Agent header.
+// Good enough as a default label -- a real rename option comes later with
+// the Trusted Devices settings screen.
+function guessDeviceName(userAgent) {
+  if (!userAgent) return "Unknown device";
+
+  let os = "Unknown OS";
+  if (userAgent.includes("Windows")) os = "Windows";
+  else if (userAgent.includes("Mac OS")) os = "Mac";
+  else if (userAgent.includes("Android")) os = "Android";
+  else if (userAgent.includes("iPhone") || userAgent.includes("iPad")) os = "iOS";
+  else if (userAgent.includes("Linux")) os = "Linux";
+
+  let browser = "Unknown browser";
+  if (userAgent.includes("Edg/")) browser = "Edge";
+  else if (userAgent.includes("Chrome/")) browser = "Chrome";
+  else if (userAgent.includes("Firefox/")) browser = "Firefox";
+  else if (userAgent.includes("Safari/")) browser = "Safari";
+
+  return `${browser} on ${os}`;
+}
+
 export default {
   async fetch(request, env) {
     try {
@@ -135,10 +157,11 @@ async function handleVerifyOtp(request, env) {
   await env.DB.prepare("UPDATE otp_codes SET used_at = ? WHERE id = ?").bind(now, otpRow.id).run();
 
   const deviceToken = generateDeviceToken();
+  const deviceName = guessDeviceName(request.headers.get("User-Agent"));
   await env.DB.prepare(
     "INSERT INTO trusted_devices (device_token, device_name, verified_by, last_used_at) VALUES (?, ?, ?, ?)"
   )
-    .bind(deviceToken, "Unnamed device", user.id, now)
+    .bind(deviceToken, deviceName, user.id, now)
     .run();
 
   await env.DB.prepare("UPDATE users SET last_login_at = ? WHERE id = ?").bind(now, user.id).run();
