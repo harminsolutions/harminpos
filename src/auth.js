@@ -1,7 +1,7 @@
 // All hashing here uses the Web Crypto API, which is built into
 // Cloudflare Workers -- no external packages needed.
 
-const PBKDF2_ITERATIONS = 210000; // current OWASP-recommended minimum for PBKDF2-SHA256
+const PBKDF2_ITERATIONS = 100000; // Workers' Web Crypto implementation caps PBKDF2 at 100,000 -- this is the platform maximum, not a security choice
 
 function bufferToHex(buffer) {
   return Array.from(buffer).map((b) => b.toString(16).padStart(2, "0")).join("");

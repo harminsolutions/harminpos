@@ -18,21 +18,32 @@ function jsonResponse(data, status = 200) {
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
+    try {
+      const url = new URL(request.url);
 
-    if (request.method === "GET" && url.pathname === "/") {
-      return new Response(HTML_PAGE, { headers: { "content-type": "text/html" } });
+      if (request.method === "GET" && url.pathname === "/") {
+        return new Response(HTML_PAGE, { headers: { "content-type": "text/html" } });
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/setup") {
+        return handleSetup(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/verify-otp") {
+        return handleVerifyOtp(request, env);
+      }
+
+      return new Response("Not found", { status: 404 });
+    } catch (err) {
+      // Catches anything unexpected so the browser always gets readable JSON
+      // back instead of Cloudflare's generic HTML error page. The real
+      // detail still shows up in `wrangler tail` either way.
+      console.error("Unhandled error:", err);
+      return new Response(JSON.stringify({ error: "Something went wrong on our end." }), {
+        status: 500,
+        headers: { "content-type": "application/json" },
+      });
     }
-
-    if (request.method === "POST" && url.pathname === "/api/setup") {
-      return handleSetup(request, env);
-    }
-
-    if (request.method === "POST" && url.pathname === "/api/verify-otp") {
-      return handleVerifyOtp(request, env);
-    }
-
-    return new Response("Not found", { status: 404 });
   },
 };
 
