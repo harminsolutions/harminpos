@@ -122,6 +122,26 @@ export default {
         return handleCreateProduct(request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/products/remove") {
+        return handleRemoveProduct(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/suppliers") {
+        return handleListSuppliers(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/suppliers") {
+        return handleCreateSupplier(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/users") {
+        return handleListUsers(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/users") {
+        return handleCreateUser(request, env);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/sales") {
         return handleCreateSale(request, env);
       }
@@ -574,7 +594,8 @@ async function handleCreateProduct(request, env) {
   }
 
   const body = await request.json();
-  const { name, item_type, unit_price, cost_price, sku, stock_quantity, sst_applicable, sst_rate } = body;
+  const { name, item_type, unit_price, cost_price, sku, stock_quantity, sst_applicable, sst_rate, supplier_id } =
+    body;
 
   if (!name || !item_type || unit_price === undefined || unit_price === null || unit_price === "") {
     return jsonResponse({ error: "Name, type, and price are required." }, 400);
@@ -603,10 +624,10 @@ async function handleCreateProduct(request, env) {
   const sstRateValue = sstApplicable ? Number(sst_rate) || 0 : null;
 
   const result = await env.DB.prepare(
-    `INSERT INTO products (sku, name, item_type, unit_price, cost_price, stock_quantity, sst_applicable, sst_rate)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO products (sku, name, item_type, unit_price, cost_price, stock_quantity, sst_applicable, sst_rate, supplier_id)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(sku || null, name, item_type, priceSen, costSen, stockValue, sstApplicable, sstRateValue)
+    .bind(sku || null, name, item_type, priceSen, costSen, stockValue, sstApplicable, sstRateValue, supplier_id || null)
     .run();
 
   await env.DB.prepare(
@@ -909,42 +930,247 @@ async function handleReportsSummary(request, env) {
   });
 }
 
+async function handleRemoveProduct(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage products." }, 403);
+  }
+
+  const { product_id } = await request.json();
+  if (!product_id) {
+    return jsonResponse({ error: "Missing product." }, 400);
+  }
+
+  const product = await env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(product_id).first();
+  if (!product) {
+    return jsonResponse({ error: "Product not found." }, 404);
+  }
+
+  // Soft delete -- keeps every past sale's line items pointing at a real
+  // row, since sale_items references product_id and history must stay
+  // intact even after a product is discontinued.
+  await env.DB.prepare("UPDATE products SET is_active = 0 WHERE id = ?").bind(product_id).run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'product_removed', 'product', ?)"
+  )
+    .bind(currentUser.id, product_id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleListSuppliers(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view suppliers." }, 403);
+  }
+
+  const { results } = await env.DB.prepare(
+    "SELECT id, name, contact_person, phone, email FROM suppliers WHERE is_active = 1 ORDER BY name"
+  ).all();
+
+  return jsonResponse({ suppliers: results });
+}
+
+async function handleCreateSupplier(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage suppliers." }, 403);
+  }
+
+  const { name, contact_person, phone, email, address } = await request.json();
+  if (!name) {
+    return jsonResponse({ error: "Supplier name is required." }, 400);
+  }
+
+  const result = await env.DB.prepare(
+    "INSERT INTO suppliers (name, contact_person, phone, email, address) VALUES (?, ?, ?, ?, ?)"
+  )
+    .bind(name, contact_person || null, phone || null, email || null, address || null)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'supplier_created', 'supplier', ?)"
+  )
+    .bind(currentUser.id, result.meta.last_row_id)
+    .run();
+
+  return jsonResponse({ success: true, id: result.meta.last_row_id });
+}
+
+async function handleListUsers(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view staff." }, 403);
+  }
+
+  const { results } = await env.DB.prepare(
+    "SELECT id, name, email, role FROM users WHERE is_active = 1 ORDER BY role, name"
+  ).all();
+
+  return jsonResponse({ users: results });
+}
+
+async function handleCreateUser(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to add accounts." }, 403);
+  }
+
+  const { name, email, role, password } = await request.json();
+
+  if (!name || !email || !role || !password) {
+    return jsonResponse({ error: "Name, email, role, and password are required." }, 400);
+  }
+  if (!["admin", "staff", "cashier"].includes(role)) {
+    return jsonResponse({ error: "Invalid role." }, 400);
+  }
+  if (password.length < 8) {
+    return jsonResponse({ error: "Password must be at least 8 characters." }, 400);
+  }
+
+  // Only the owner can create another admin account -- admins can bring on
+  // staff and cashiers, but can't promote anyone into their own tier.
+  if (role === "admin" && currentUser.role !== "owner") {
+    return jsonResponse({ error: "Only the owner can add admin accounts." }, 403);
+  }
+
+  const existingEmail = await env.DB.prepare("SELECT id FROM users WHERE email = ?").bind(email).first();
+  if (existingEmail) {
+    return jsonResponse({ error: "That email is already registered." }, 400);
+  }
+
+  const passwordHash = await hashPassword(password);
+
+  const result = await env.DB.prepare("INSERT INTO users (name, email, password_hash, role) VALUES (?, ?, ?, ?)")
+    .bind(name, email, passwordHash, role)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'user_created', 'user', ?)"
+  )
+    .bind(currentUser.id, result.meta.last_row_id)
+    .run();
+
+  return jsonResponse({ success: true, id: result.meta.last_row_id });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HarminPOS</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
-  p.sub { color: #666; margin-top: 0; margin-bottom: 24px; }
-  label { display: block; margin-top: 16px; margin-bottom: 4px; font-size: 14px; font-weight: 600; }
-  input { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
-  button { margin-top: 24px; width: 100%; padding: 12px; background: #1a1a1a; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
-  .error { color: #c0392b; margin-top: 12px; font-size: 14px; }
-  .success { color: #27ae60; margin-top: 12px; font-size: 14px; }
-  .lockWarning { background: #fff3cd; border: 1px solid #ffc107; color: #856404; padding: 10px 12px; border-radius: 6px; margin-top: 12px; font-size: 14px; }
-  input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
-  .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
-  .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
-  #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection, #dashboardSection { display: none; }
-  #productsTab, #reportsTab, #shiftOpenView { display: none; }
-  .staffBtn { text-align: left; background: white; color: #1a1a1a; border: 1px solid #ccc; margin-top: 8px; }
-  #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid #eee; }
-  h2.sectionTitle { font-size: 15px; margin-top: 32px; margin-bottom: 4px; }
-  .productRow { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 14px; }
-  .productRow span:first-child { flex: 1; }
-  .productRow span { color: #444; }
-  select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  :root {
+    --ink: #101B2D;
+    --ink-soft: #1E3350;
+    --paper: #FBF9F5;
+    --paper-edge: #E4DFD3;
+    --brass: #A87C2E;
+    --brass-bright: #C99A42;
+    --text: #16202E;
+    --text-muted: #6B7686;
+    --success: #3F7A54;
+    --danger: #B5432E;
+  }
+  * { box-sizing: border-box; }
+  body { font-family: 'Inter', system-ui, sans-serif; margin: 0; background: var(--paper); color: var(--text); }
+  h1 { font-family: 'Fraunces', serif; font-size: 22px; font-weight: 600; margin-bottom: 4px; letter-spacing: -0.01em; }
+  h2.sectionTitle { font-family: 'Fraunces', serif; font-size: 17px; font-weight: 600; color: var(--ink); margin-top: 32px; margin-bottom: 10px; }
+  p.sub { color: var(--text-muted); margin-top: 0; margin-bottom: 24px; font-size: 14px; }
+  label { display: block; margin-top: 16px; margin-bottom: 4px; font-size: 13px; font-weight: 600; color: var(--text); }
+  input, select { width: 100%; padding: 11px 12px; border: 1px solid var(--paper-edge); border-radius: 8px; font-size: 14px; box-sizing: border-box; font-family: 'Inter', sans-serif; background: white; color: var(--text); }
+  input:focus, select:focus { outline: none; border-color: var(--brass); box-shadow: 0 0 0 3px rgba(168,124,46,0.12); }
   input[type="checkbox"] { width: auto; }
+  button { margin-top: 24px; width: 100%; padding: 13px; background: var(--ink); color: white; border: none; border-radius: 8px; font-size: 14px; font-weight: 600; font-family: 'Inter', sans-serif; cursor: pointer; transition: background 0.15s ease; }
+  button:hover { background: var(--ink-soft); }
+  input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .error { color: var(--danger); margin-top: 12px; font-size: 14px; }
+  .success { color: var(--success); margin-top: 12px; font-size: 14px; }
+  .lockWarning { background: #FBF0DD; border: 1px solid var(--brass); color: #7A5A1E; padding: 10px 12px; border-radius: 8px; margin-top: 12px; font-size: 14px; }
+  .toggle { margin-top: 16px; font-size: 13px; color: var(--text-muted); text-align: center; }
+  .toggle a { color: var(--ink); cursor: pointer; text-decoration: underline; }
   .inlineLabel { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 14px; font-weight: 600; }
-  .smallBtn { width: auto; margin: 0 0 0 12px; padding: 4px 12px; font-size: 13px; }
-  #receiptSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 2px solid #1a1a1a; }
-  .totalRow { font-weight: 600; }
-  .tabBar { display: flex; gap: 4px; margin: 24px 0 8px; border-bottom: 1px solid #ddd; }
-  .tabBtn { width: auto; background: none; color: #888; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 4px; margin: 0 16px 0 0; font-weight: 600; font-size: 14px; }
-  .tabBtn.active { color: #1a1a1a; border-bottom-color: #1a1a1a; }
+  .smallBtn { width: auto; margin: 0 0 0 12px; padding: 6px 14px; font-size: 13px; background: white; color: var(--ink); border: 1px solid var(--paper-edge); }
+  .smallBtn:hover { background: var(--paper); }
+  .staffBtn { text-align: left; background: white; color: var(--text); border: 1px solid var(--paper-edge); margin-top: 8px; font-weight: 500; }
+  .productRow { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--paper-edge); font-size: 14px; }
+  .productRow span:first-child { flex: 1; }
+  .productRow span { color: var(--text); }
+  .totalRow { font-weight: 700; }
+
+  /* Auth screens keep a narrow, centered card feel */
+  #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection {
+    display: none; max-width: 420px; margin: 60px auto; padding: 0 24px;
+  }
+  #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid var(--paper-edge); }
+
+  /* Dashboard shell */
+  #dashboardSection { display: none; }
+  .topBar { background: var(--ink); color: white; padding: 16px 28px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
+  .brand-mark { font-family: 'Fraunces', serif; font-weight: 600; font-size: 20px; letter-spacing: -0.01em; }
+  .topBarUser { font-size: 13px; color: #A7B3C4; }
+  .tabBar { background: white; border-bottom: 1px solid var(--paper-edge); padding: 0 28px; display: flex; gap: 4px; overflow-x: auto; }
+  .tabBtn { width: auto; background: none; color: var(--text-muted); border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 14px 4px; margin: 0 20px 0 0; font-weight: 600; font-size: 14px; white-space: nowrap; }
+  .tabBtn:hover { background: none; color: var(--ink); }
+  .tabBtn.active { color: var(--ink); border-bottom-color: var(--brass); }
+  #productsTab, #reportsTab, #staffTab { display: none; }
+  .padded-panel { max-width: 880px; margin: 0 auto; padding: 28px; }
+
+  /* Checkout: two-column POS layout */
+  #checkoutTab { display: none; }
+  .pos-layout { display: grid; grid-template-columns: 1fr 400px; align-items: start; }
+  .pos-left { padding: 24px 28px; }
+  .pos-right { background: white; border-left: 1px solid var(--paper-edge); padding: 24px; min-height: calc(100vh - 113px); display: flex; flex-direction: column; position: sticky; top: 0; }
+  #shiftClosedView, #shiftOpenView { background: white; border: 1px solid var(--paper-edge); border-radius: 10px; padding: 16px 18px; margin-bottom: 20px; }
+  #shiftClosedView button, #shiftOpenView button { margin-top: 12px; }
+  #posSearch { margin-bottom: 18px; }
+  .product-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+  .product-card { background: white; border: 1px solid var(--paper-edge); border-radius: 10px; padding: 16px 14px; cursor: pointer; transition: transform 0.12s ease, box-shadow 0.12s ease, border-color 0.12s ease; text-align: left; width: 100%; margin: 0; }
+  .product-card:hover { border-color: var(--brass); box-shadow: 0 4px 14px rgba(16,27,45,0.10); transform: translateY(-2px); background: white; }
+  .product-card .p-name { font-weight: 600; font-size: 14px; color: var(--text); margin-bottom: 8px; line-height: 1.3; }
+  .product-card .p-price { font-family: 'Fraunces', serif; font-size: 18px; font-weight: 600; color: var(--brass); }
+  .product-card .p-meta { font-size: 11px; color: var(--text-muted); margin-top: 6px; }
+  .order-header { font-family: 'Fraunces', serif; font-size: 18px; font-weight: 600; color: var(--ink); margin-bottom: 4px; }
+  .order-items { flex: 1; overflow-y: auto; min-height: 80px; font-variant-numeric: tabular-nums; margin-top: 12px; }
+  .order-line { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px dashed var(--paper-edge); font-size: 14px; gap: 10px; }
+  .order-line .lineName { flex: 1; }
+  .order-line .lineQty { color: var(--text-muted); font-size: 12px; display: block; margin-top: 2px; }
+  .order-totals { border-top: 2px solid var(--ink); padding-top: 10px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+  .totalLine { display: flex; justify-content: space-between; padding: 3px 0; font-size: 13px; color: var(--text-muted); }
+  .grandTotal { display: flex; justify-content: space-between; align-items: baseline; padding-top: 8px; font-family: 'Fraunces', serif; font-size: 26px; font-weight: 600; color: var(--ink); }
+  .btn-primary { background: var(--brass); }
+  .btn-primary:hover { background: var(--brass-bright); }
+  #receiptSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 2px dashed var(--paper-edge); }
+
+  @media (max-width: 860px) {
+    .pos-layout { grid-template-columns: 1fr; }
+    .pos-right { border-left: none; border-top: 3px solid var(--ink); position: static; min-height: auto; }
+    .pos-left, .pos-right { padding: 16px; }
+    .topBar { padding: 12px 16px; }
+    .tabBar { padding: 0 16px; }
+    .padded-panel { padding: 16px; }
+  }
 </style>
 </head>
 <body>
@@ -1009,63 +1235,81 @@ const HTML_PAGE = `<!DOCTYPE html>
   </div>
 
   <div id="dashboardSection">
-    <h1>HarminPOS</h1>
-    <p class="sub" id="welcomeMsg"></p>
+    <div class="topBar">
+      <span class="brand-mark">HarminPOS</span>
+      <span class="topBarUser" id="welcomeMsg"></span>
+    </div>
 
     <div class="tabBar">
       <button id="tabCheckoutBtn" class="tabBtn">Checkout</button>
       <button id="tabProductsBtn" class="tabBtn">Products</button>
       <button id="tabReportsBtn" class="tabBtn">Reports</button>
+      <button id="tabStaffBtn" class="tabBtn">Staff</button>
     </div>
 
-    <div id="checkoutTab">
-      <div id="shiftClosedView">
-        <h2 class="sectionTitle">Open your shift</h2>
-        <p class="sub">Count your starting cash before you can make sales.</p>
-        <label for="openingCash">Starting cash (RM)</label>
-        <input id="openingCash" type="number" step="0.01" min="0" />
-        <button id="openShiftBtn">Open shift</button>
-        <div id="openShiftMsg"></div>
-      </div>
-
-      <div id="shiftOpenView">
-        <p class="sub" id="shiftStatusText"></p>
-        <button id="closeShiftBtn" class="smallBtn" style="margin-left: 0;">Close shift</button>
-        <div id="closeShiftForm" style="display: none; margin-top: 16px;">
-          <label for="closingCash">Counted cash (RM)</label>
-          <input id="closingCash" type="number" step="0.01" min="0" />
-          <button id="confirmCloseShiftBtn">Confirm close</button>
+    <div id="checkoutTab" class="pos-layout">
+      <div class="pos-left">
+        <div id="shiftClosedView">
+          <h2 class="sectionTitle" style="margin-top: 0;">Open your shift</h2>
+          <p class="sub" style="margin-bottom: 0;">Count your starting cash before you can make sales.</p>
+          <label for="openingCash">Starting cash (RM)</label>
+          <input id="openingCash" type="number" step="0.01" min="0" />
+          <button id="openShiftBtn">Open shift</button>
+          <div id="openShiftMsg"></div>
         </div>
-        <div id="closeShiftMsg"></div>
+
+        <div id="shiftOpenView">
+          <p class="sub" id="shiftStatusText" style="margin-bottom: 0;"></p>
+          <button id="closeShiftBtn" class="smallBtn" style="margin-left: 0;">Close shift</button>
+          <div id="closeShiftForm" style="display: none; margin-top: 16px;">
+            <label for="closingCash">Counted cash (RM)</label>
+            <input id="closingCash" type="number" step="0.01" min="0" />
+            <button id="confirmCloseShiftBtn">Confirm close</button>
+          </div>
+          <div id="closeShiftMsg"></div>
+        </div>
+
+        <input id="posSearch" type="text" placeholder="Search products..." />
+        <div id="checkoutProductList" class="product-grid"></div>
       </div>
 
-      <h2 class="sectionTitle">Tap to add</h2>
-      <div id="checkoutProductList"></div>
+      <div class="pos-right">
+        <div class="order-header">Current Order</div>
+        <div id="cartItems" class="order-items"></div>
+        <div id="cartTotals" class="order-totals"></div>
+        <label for="paymentMethod">Payment method</label>
+        <select id="paymentMethod">
+          <option value="cash">Cash</option>
+          <option value="duitnow_qr">DuitNow QR</option>
+          <option value="card">Card</option>
+        </select>
+        <button id="checkoutBtn" class="btn-primary">Complete sale</button>
+        <div id="checkoutMsg"></div>
 
-      <h2 class="sectionTitle">Cart</h2>
-      <div id="cartItems"></div>
-      <div id="cartTotals"></div>
-      <label for="paymentMethod">Payment method</label>
-      <select id="paymentMethod">
-        <option value="cash">Cash</option>
-        <option value="duitnow_qr">DuitNow QR</option>
-        <option value="card">Card</option>
-      </select>
-      <button id="checkoutBtn">Complete sale</button>
-      <div id="checkoutMsg"></div>
-
-      <div id="receiptSection">
-        <h2 class="sectionTitle">Sale complete</h2>
-        <p class="sub">Receipt <span id="receiptNumber"></span></p>
-        <div id="receiptItems"></div>
-        <div class="productRow totalRow"><span>Total</span><span id="receiptTotal"></span></div>
-        <button id="newSaleBtn">New sale</button>
+        <div id="receiptSection">
+          <h2 class="sectionTitle" style="margin-top: 0;">Sale complete</h2>
+          <p class="sub">Receipt <span id="receiptNumber"></span></p>
+          <div id="receiptItems"></div>
+          <div class="productRow totalRow"><span>Total</span><span id="receiptTotal"></span></div>
+          <button id="newSaleBtn">New sale</button>
+        </div>
       </div>
     </div>
 
-    <div id="productsTab">
+    <div id="productsTab" class="padded-panel">
       <h2 class="sectionTitle">All products</h2>
       <div id="manageProductList"></div>
+
+      <h2 class="sectionTitle">Suppliers</h2>
+      <div id="supplierList"></div>
+      <label for="newSupplierName">Supplier name</label>
+      <input id="newSupplierName" type="text" />
+      <label for="newSupplierContact">Contact person (optional)</label>
+      <input id="newSupplierContact" type="text" />
+      <label for="newSupplierPhone">Phone (optional)</label>
+      <input id="newSupplierPhone" type="text" />
+      <button id="addSupplierBtn">Add supplier</button>
+      <div id="addSupplierMsg"></div>
 
       <div id="addProductSection">
         <h2 class="sectionTitle">Add a product</h2>
@@ -1091,16 +1335,37 @@ const HTML_PAGE = `<!DOCTYPE html>
           <label for="prodSstRate">SST rate (%)</label>
           <input id="prodSstRate" type="number" step="0.01" min="0" max="100" placeholder="e.g. 6" />
         </div>
+        <label for="prodSupplier">Supplier (optional)</label>
+        <select id="prodSupplier">
+          <option value="">None</option>
+        </select>
         <button id="addProductBtn">Add product</button>
         <div id="addProductMsg"></div>
       </div>
     </div>
 
-    <div id="reportsTab">
+    <div id="reportsTab" class="padded-panel">
       <h2 class="sectionTitle">Today</h2>
       <div class="productRow"><span>Sales</span><span id="reportSaleCount"></span></div>
       <div class="productRow"><span>Revenue</span><span id="reportRevenue"></span></div>
       <div class="productRow totalRow"><span>Profit</span><span id="reportProfit"></span></div>
+    </div>
+
+    <div id="staffTab" class="padded-panel">
+      <h2 class="sectionTitle">Team</h2>
+      <div id="staffListManage"></div>
+
+      <h2 class="sectionTitle">Add team member</h2>
+      <label for="newStaffName">Name</label>
+      <input id="newStaffName" type="text" />
+      <label for="newStaffEmail">Email</label>
+      <input id="newStaffEmail" type="email" />
+      <label for="newStaffPassword">Temporary password</label>
+      <input id="newStaffPassword" type="password" />
+      <label for="newStaffRole">Role</label>
+      <select id="newStaffRole"></select>
+      <button id="addStaffBtn">Add team member</button>
+      <div id="addStaffMsg"></div>
     </div>
   </div>
 
@@ -1112,18 +1377,22 @@ let cart = [];
 let allProducts = [];
 
 function showTab(tab) {
-  document.getElementById("checkoutTab").style.display = tab === "checkout" ? "block" : "none";
+  document.getElementById("checkoutTab").style.display = tab === "checkout" ? "grid" : "none";
   document.getElementById("productsTab").style.display = tab === "products" ? "block" : "none";
   document.getElementById("reportsTab").style.display = tab === "reports" ? "block" : "none";
+  document.getElementById("staffTab").style.display = tab === "staff" ? "block" : "none";
   document.getElementById("tabCheckoutBtn").className = "tabBtn" + (tab === "checkout" ? " active" : "");
   document.getElementById("tabProductsBtn").className = "tabBtn" + (tab === "products" ? " active" : "");
   document.getElementById("tabReportsBtn").className = "tabBtn" + (tab === "reports" ? " active" : "");
+  document.getElementById("tabStaffBtn").className = "tabBtn" + (tab === "staff" ? " active" : "");
   if (tab === "reports") loadReports();
+  if (tab === "staff") loadStaffTab();
 }
 
 document.getElementById("tabCheckoutBtn").addEventListener("click", () => showTab("checkout"));
 document.getElementById("tabProductsBtn").addEventListener("click", () => showTab("products"));
 document.getElementById("tabReportsBtn").addEventListener("click", () => showTab("reports"));
+document.getElementById("tabStaffBtn").addEventListener("click", () => showTab("staff"));
 
 // Ticks down a lockout countdown using the real server timestamp, so it
 // shows the correct remaining time even after a page refresh -- refreshing
@@ -1363,16 +1632,24 @@ document.getElementById("backToStaffList").addEventListener("click", () => {
 
 document.getElementById("usePasswordInstead").addEventListener("click", () => showOnly("loginSection"));
 
+let allSuppliers = [];
+let currentUserRole = null;
+
 async function loadDashboard() {
   const me = await fetch("/api/me").then((r) => r.json());
+  currentUserRole = me.role;
   document.getElementById("welcomeMsg").textContent = "Logged in as " + me.name + " (" + me.role + ")";
-  // Cashiers live on the Checkout tab -- product management and business
-  // reports aren't their job.
+  // Cashiers live on the Checkout tab -- everything else is management territory.
   document.getElementById("tabProductsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
   document.getElementById("tabReportsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
+  document.getElementById("tabStaffBtn").style.display = ["owner", "admin"].includes(me.role)
+    ? "inline-block"
+    : "none";
+  populateRoleDropdown();
   cart = [];
   renderCart();
   await loadProducts();
+  await loadSuppliers();
   await loadShiftStatus();
   showTab("checkout");
   showOnly("dashboardSection");
@@ -1390,25 +1667,36 @@ function renderCheckoutProductList() {
   const container = document.getElementById("checkoutProductList");
   container.innerHTML = "";
 
+  const query = document.getElementById("posSearch").value.trim().toLowerCase();
+  const visible = query ? allProducts.filter((p) => p.name.toLowerCase().includes(query)) : allProducts;
+
   if (allProducts.length === 0) {
     container.innerHTML = '<p class="sub">No products yet -- add one in the Products tab.</p>';
     return;
   }
+  if (visible.length === 0) {
+    container.innerHTML = '<p class="sub">No products match "' + query + '".</p>';
+    return;
+  }
 
-  allProducts.forEach((p) => {
-    const row = document.createElement("div");
-    row.className = "productRow";
+  visible.forEach((p) => {
+    const card = document.createElement("button");
+    card.className = "product-card";
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
-    row.innerHTML =
-      "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
-    const addBtn = document.createElement("button");
-    addBtn.textContent = "Add";
-    addBtn.className = "smallBtn";
-    addBtn.addEventListener("click", () => addToCart(p));
-    row.appendChild(addBtn);
-    container.appendChild(row);
+    card.innerHTML =
+      '<div class="p-name">' +
+      p.name +
+      '</div><div class="p-price">RM ' +
+      p.unit_price_display +
+      '</div><div class="p-meta">' +
+      stockText +
+      "</div>";
+    card.addEventListener("click", () => addToCart(p));
+    container.appendChild(card);
   });
 }
+
+document.getElementById("posSearch").addEventListener("input", renderCheckoutProductList);
 
 function renderManageProductList() {
   const container = document.getElementById("manageProductList");
@@ -1425,6 +1713,21 @@ function renderManageProductList() {
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
     row.innerHTML =
       "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
+    const removeBtn = document.createElement("button");
+    removeBtn.textContent = "Remove";
+    removeBtn.className = "smallBtn";
+    removeBtn.addEventListener("click", async () => {
+      if (!confirm("Remove " + p.name + "? This can't easily be undone.")) return;
+      const res = await fetch("/api/products/remove", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ product_id: p.id }),
+      });
+      if (res.ok) {
+        await loadProducts();
+      }
+    });
+    row.appendChild(removeBtn);
     container.appendChild(row);
   });
 }
@@ -1446,6 +1749,7 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
   const stock_quantity = document.getElementById("prodStock").value;
   const sstApplicable = document.getElementById("prodSstApplicable").checked;
   const sstRatePercent = document.getElementById("prodSstRate").value;
+  const supplier_id = document.getElementById("prodSupplier").value;
   const msg = document.getElementById("addProductMsg");
   msg.textContent = "";
 
@@ -1461,6 +1765,7 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
       stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
       sst_applicable: sstApplicable,
       sst_rate: sstApplicable ? Number(sstRatePercent || 0) / 100 : undefined,
+      supplier_id: supplier_id || undefined,
     }),
   });
   const data = await res.json();
@@ -1506,7 +1811,7 @@ function renderCart() {
   container.innerHTML = "";
 
   if (cart.length === 0) {
-    container.innerHTML = '<p class="sub">Tap "Add" on a product above to start a sale.</p>';
+    container.innerHTML = '<p class="sub">Tap a product to start an order.</p>';
     document.getElementById("cartTotals").innerHTML = "";
     return;
   }
@@ -1521,13 +1826,13 @@ function renderCart() {
     sstTotal += lineSst;
 
     const row = document.createElement("div");
-    row.className = "productRow";
+    row.className = "order-line";
     row.innerHTML =
-      "<span>" +
+      '<span class="lineName">' +
       item.name +
-      " x" +
+      '<span class="lineQty">Qty ' +
       item.quantity +
-      "</span><span>RM " +
+      "</span></span><span>RM " +
       (lineSubtotal + lineSst).toFixed(2) +
       "</span>";
     const removeBtn = document.createElement("button");
@@ -1543,13 +1848,11 @@ function renderCart() {
 
   const total = subtotal + sstTotal;
   document.getElementById("cartTotals").innerHTML =
-    '<div class="productRow"><span>Subtotal</span><span>RM ' +
+    '<div class="totalLine"><span>Subtotal</span><span>RM ' +
     subtotal.toFixed(2) +
-    '</span></div>' +
-    '<div class="productRow"><span>SST</span><span>RM ' +
+    '</span></div><div class="totalLine"><span>SST</span><span>RM ' +
     sstTotal.toFixed(2) +
-    '</span></div>' +
-    '<div class="productRow totalRow"><span>Total</span><span>RM ' +
+    '</span></div><div class="grandTotal"><span>Total</span><span>RM ' +
     total.toFixed(2) +
     "</span></div>";
 }
@@ -1683,6 +1986,138 @@ async function loadReports() {
   document.getElementById("reportRevenue").textContent = "RM " + data.revenue;
   document.getElementById("reportProfit").textContent = "RM " + data.profit;
 }
+
+async function loadSuppliers() {
+  const res = await fetch("/api/suppliers");
+  const data = await res.json();
+  allSuppliers = data.suppliers || [];
+  renderSupplierList();
+  renderSupplierDropdown();
+}
+
+function renderSupplierList() {
+  const container = document.getElementById("supplierList");
+  container.innerHTML = "";
+  if (allSuppliers.length === 0) {
+    container.innerHTML = '<p class="sub">No suppliers yet.</p>';
+    return;
+  }
+  allSuppliers.forEach((s) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    row.innerHTML =
+      "<span>" + s.name + "</span><span>" + (s.contact_person || "") + "</span><span>" + (s.phone || "") + "</span>";
+    container.appendChild(row);
+  });
+}
+
+function renderSupplierDropdown() {
+  const select = document.getElementById("prodSupplier");
+  select.innerHTML = '<option value="">None</option>';
+  allSuppliers.forEach((s) => {
+    const opt = document.createElement("option");
+    opt.value = s.id;
+    opt.textContent = s.name;
+    select.appendChild(opt);
+  });
+}
+
+document.getElementById("addSupplierBtn").addEventListener("click", async () => {
+  const name = document.getElementById("newSupplierName").value.trim();
+  const contact_person = document.getElementById("newSupplierContact").value.trim();
+  const phone = document.getElementById("newSupplierPhone").value.trim();
+  const msg = document.getElementById("addSupplierMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/suppliers", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name,
+      contact_person: contact_person || undefined,
+      phone: phone || undefined,
+    }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Supplier added!";
+  msg.className = "success";
+  document.getElementById("newSupplierName").value = "";
+  document.getElementById("newSupplierContact").value = "";
+  document.getElementById("newSupplierPhone").value = "";
+  await loadSuppliers();
+});
+
+function populateRoleDropdown() {
+  const select = document.getElementById("newStaffRole");
+  select.innerHTML = "";
+  // Only the owner can create another admin -- matches the server-side check.
+  const options =
+    currentUserRole === "owner"
+      ? [
+          ["admin", "Admin"],
+          ["staff", "Staff"],
+          ["cashier", "Cashier"],
+        ]
+      : [
+          ["staff", "Staff"],
+          ["cashier", "Cashier"],
+        ];
+  options.forEach(([value, label]) => {
+    const opt = document.createElement("option");
+    opt.value = value;
+    opt.textContent = label;
+    select.appendChild(opt);
+  });
+}
+
+async function loadStaffTab() {
+  const res = await fetch("/api/users");
+  const data = await res.json();
+  const container = document.getElementById("staffListManage");
+  container.innerHTML = "";
+  (data.users || []).forEach((u) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    row.innerHTML = "<span>" + u.name + "</span><span>" + u.email + "</span><span>" + u.role + "</span>";
+    container.appendChild(row);
+  });
+}
+
+document.getElementById("addStaffBtn").addEventListener("click", async () => {
+  const name = document.getElementById("newStaffName").value.trim();
+  const email = document.getElementById("newStaffEmail").value.trim();
+  const password = document.getElementById("newStaffPassword").value;
+  const role = document.getElementById("newStaffRole").value;
+  const msg = document.getElementById("addStaffMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/users", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name, email, password, role }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Team member added! Share the temporary password with them directly.";
+  msg.className = "success";
+  document.getElementById("newStaffName").value = "";
+  document.getElementById("newStaffEmail").value = "";
+  document.getElementById("newStaffPassword").value = "";
+  await loadStaffTab();
+});
 
 checkDeviceStatus();
 </script>
