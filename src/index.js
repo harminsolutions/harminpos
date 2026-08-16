@@ -527,6 +527,8 @@ const HTML_PAGE = `<!DOCTYPE html>
   button { margin-top: 24px; width: 100%; padding: 12px; background: #1a1a1a; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
   .error { color: #c0392b; margin-top: 12px; font-size: 14px; }
   .success { color: #27ae60; margin-top: 12px; font-size: 14px; }
+  .lockWarning { background: #fff3cd; border: 1px solid #ffc107; color: #856404; padding: 10px 12px; border-radius: 6px; margin-top: 12px; font-size: 14px; }
+  input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
   .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
   .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
   #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection { display: none; }
@@ -745,6 +747,8 @@ async function loadStaffList() {
       document.getElementById("pinPadSection").style.display = "block";
       const pinInput = document.getElementById("pinInput");
       pinInput.value = "";
+      pinInput.disabled = false;
+      document.getElementById("pinLoginBtn").disabled = false;
       document.getElementById("pinLoginMsg").textContent = "";
       pinInput.focus();
     });
@@ -766,7 +770,15 @@ document.getElementById("pinLoginBtn").addEventListener("click", async () => {
 
   if (!res.ok) {
     msg.textContent = data.error;
-    msg.className = "error";
+    if (res.status === 423) {
+      // Locked out -- disable the field entirely rather than just showing
+      // an error, so it's visually obvious retrying won't help right now.
+      msg.className = "lockWarning";
+      document.getElementById("pinInput").disabled = true;
+      document.getElementById("pinLoginBtn").disabled = true;
+    } else {
+      msg.className = "error";
+    }
     return;
   }
 
