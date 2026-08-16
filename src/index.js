@@ -1,5 +1,6 @@
 import {
   hashPassword,
+  verifyPassword,
   generateOTP,
   hashOTP,
   createSessionToken,
@@ -38,6 +39,16 @@ function guessDeviceName(userAgent) {
   return `${browser} on ${os}`;
 }
 
+function parseCookies(cookieHeader) {
+  const cookies = {};
+  if (!cookieHeader) return cookies;
+  cookieHeader.split(";").forEach((pair) => {
+    const [key, ...rest] = pair.trim().split("=");
+    cookies[key] = rest.join("=");
+  });
+  return cookies;
+}
+
 export default {
   async fetch(request, env) {
     try {
@@ -49,6 +60,10 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/setup") {
         return handleSetup(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/login") {
+        return handleLogin(request, env);
       }
 
       if (request.method === "POST" && url.pathname === "/api/verify-otp") {
@@ -126,6 +141,85 @@ async function handleSetup(request, env) {
   return jsonResponse({ success: true, email });
 }
 
+async function handleLogin(request, env) {
+  const { email, password } = await request.json();
+
+  if (!email || !password) {
+    return jsonResponse({ error: "Email and password are required." }, 400);
+  }
+
+  const user = await env.DB.prepare(
+    "SELECT id, password_hash, is_active FROM users WHERE email = ?"
+  )
+    .bind(email)
+    .first();
+
+  // Same generic message whether the email doesn't exist or the password is
+  // wrong -- this avoids confirming to an attacker which emails are registered.
+  const invalidCredentials = () => jsonResponse({ error: "Invalid email or password." }, 400);
+
+  if (!user || !user.is_active) {
+    return invalidCredentials();
+  }
+
+  const validPassword = await verifyPassword(password, user.password_hash);
+  if (!validPassword) {
+    return invalidCredentials();
+  }
+
+  // Check whether this browser already carries a trusted device cookie.
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  let trustedDevice = null;
+  if (cookies.device) {
+    trustedDevice = await env.DB.prepare(
+      "SELECT id FROM trusted_devices WHERE device_token = ? AND is_active = 1"
+    )
+      .bind(cookies.device)
+      .first();
+  }
+
+  const now = new Date().toISOString();
+
+  if (trustedDevice) {
+    // Trusted device -- log straight in, no OTP needed.
+    await env.DB.prepare("UPDATE trusted_devices SET last_used_at = ? WHERE id = ?")
+      .bind(now, trustedDevice.id)
+      .run();
+    await env.DB.prepare("UPDATE users SET last_login_at = ? WHERE id = ?").bind(now, user.id).run();
+    await env.DB.prepare(
+      "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'login', 'user', ?)"
+    )
+      .bind(user.id, user.id)
+      .run();
+
+    const sessionToken = await createSessionToken(user.id, env.SESSION_SECRET);
+    const headers = new Headers({ "content-type": "application/json" });
+    headers.append(
+      "Set-Cookie",
+      `session=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`
+    );
+    return new Response(JSON.stringify({ success: true, trusted: true }), { headers });
+  }
+
+  // New or unrecognized device -- fall back to email OTP, same as setup does.
+  const otp = generateOTP();
+  const otpHash = await hashOTP(otp);
+  const expiresAt = new Date(Date.now() + OTP_TTL_MS).toISOString();
+
+  await env.DB.prepare(
+    "INSERT INTO otp_codes (user_id, code_hash, purpose, expires_at) VALUES (?, ?, 'login', ?)"
+  )
+    .bind(user.id, otpHash, expiresAt)
+    .run();
+
+  const emailSent = await sendOTPEmail(env, email, otp);
+  if (!emailSent) {
+    return jsonResponse({ error: "Could not send the verification email. Try again." }, 500);
+  }
+
+  return jsonResponse({ success: true, otp_required: true, email });
+}
+
 async function handleVerifyOtp(request, env) {
   const { email, code } = await request.json();
 
@@ -192,7 +286,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>HarminPOS setup</title>
+<title>HarminPOS</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 400px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
   h1 { font-size: 20px; margin-bottom: 4px; }
@@ -202,7 +296,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   button { margin-top: 24px; width: 100%; padding: 12px; background: #1a1a1a; color: white; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
   .error { color: #c0392b; margin-top: 12px; font-size: 14px; }
   .success { color: #27ae60; margin-top: 12px; font-size: 14px; }
-  #otpSection { display: none; }
+  .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
+  .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
+  #loginSection, #otpSection { display: none; }
 </style>
 </head>
 <body>
@@ -217,6 +313,18 @@ const HTML_PAGE = `<!DOCTYPE html>
     <input id="password" type="password" />
     <button id="setupBtn">Create account</button>
     <div id="setupMsg"></div>
+    <p class="toggle">Already set up? <a id="showLogin">Log in instead</a></p>
+  </div>
+
+  <div id="loginSection">
+    <h1>Log in to HarminPOS</h1>
+    <p class="sub">Enter your email and password.</p>
+    <label for="loginEmail">Email</label>
+    <input id="loginEmail" type="email" />
+    <label for="loginPassword">Password</label>
+    <input id="loginPassword" type="password" />
+    <button id="loginBtn">Log in</button>
+    <div id="loginMsg"></div>
   </div>
 
   <div id="otpSection">
@@ -230,6 +338,14 @@ const HTML_PAGE = `<!DOCTYPE html>
 
 <script>
 let pendingEmail = "";
+
+function showOnly(id) {
+  ["setupSection", "loginSection", "otpSection"].forEach((sectionId) => {
+    document.getElementById(sectionId).style.display = sectionId === id ? "block" : "none";
+  });
+}
+
+document.getElementById("showLogin").addEventListener("click", () => showOnly("loginSection"));
 
 document.getElementById("setupBtn").addEventListener("click", async () => {
   const name = document.getElementById("name").value.trim();
@@ -252,8 +368,36 @@ document.getElementById("setupBtn").addEventListener("click", async () => {
   }
 
   pendingEmail = email;
-  document.getElementById("setupSection").style.display = "none";
-  document.getElementById("otpSection").style.display = "block";
+  showOnly("otpSection");
+});
+
+document.getElementById("loginBtn").addEventListener("click", async () => {
+  const email = document.getElementById("loginEmail").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  const msg = document.getElementById("loginMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  if (data.trusted) {
+    msg.textContent = "Logged in!";
+    msg.className = "success";
+    return;
+  }
+
+  pendingEmail = email;
+  showOnly("otpSection");
 });
 
 document.getElementById("verifyBtn").addEventListener("click", async () => {
