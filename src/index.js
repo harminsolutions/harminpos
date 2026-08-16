@@ -617,7 +617,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .staffBtn { text-align: left; background: white; color: #1a1a1a; border: 1px solid #ccc; margin-top: 8px; }
   #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid #eee; }
   h2.sectionTitle { font-size: 15px; margin-top: 32px; margin-bottom: 4px; }
-  .productRow { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 14px; }
+  .productRow { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 14px; }
   .productRow span:first-child { flex: 1; }
   .productRow span { color: #444; }
   select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
