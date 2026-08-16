@@ -11,7 +11,7 @@ import { sendOTPEmail } from "./email.js";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_PIN_ATTEMPTS = 5;
-const PIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
+const PIN_LOCKOUT_MS = 5 * 60 * 1000; // 5 minutes
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -414,7 +414,7 @@ async function handleStaffList(request, env) {
   // Only staff who have actually set a PIN show up here -- no point
   // offering a picker option that can't log in.
   const { results } = await env.DB.prepare(
-    "SELECT id, name, role FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL ORDER BY name"
+    "SELECT id, name, role, pin_locked_until FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL ORDER BY name"
   ).all();
 
   return jsonResponse({ staff: results });
@@ -453,7 +453,10 @@ async function handlePinLogin(request, env) {
 
   if (user.pin_locked_until && new Date(user.pin_locked_until) > now) {
     return jsonResponse(
-      { error: "Too many wrong attempts. Log in with your password instead." },
+      {
+        error: "Too many wrong attempts. Log in with your password instead.",
+        locked_until: user.pin_locked_until,
+      },
       423
     );
   }
@@ -474,7 +477,10 @@ async function handlePinLogin(request, env) {
         .bind(user.id, user.id)
         .run();
       return jsonResponse(
-        { error: "Too many wrong attempts. This PIN is now locked -- log in with your password instead." },
+        {
+          error: "Too many wrong attempts. This PIN is now locked -- log in with your password instead.",
+          locked_until: lockedUntil,
+        },
         423
       );
     }
@@ -600,6 +606,44 @@ const HTML_PAGE = `<!DOCTYPE html>
 <script>
 let pendingEmail = "";
 let selectedStaffId = null;
+let countdownInterval = null;
+
+// Ticks down a lockout countdown using the real server timestamp, so it
+// shows the correct remaining time even after a page refresh -- refreshing
+// re-fetches this timestamp from the database rather than resetting a
+// client-side timer back to the full duration.
+function showLockCountdown(lockedUntilIso) {
+  const msg = document.getElementById("pinLoginMsg");
+  const pinInput = document.getElementById("pinInput");
+  const pinBtn = document.getElementById("pinLoginBtn");
+
+  pinInput.disabled = true;
+  pinBtn.disabled = true;
+  msg.className = "lockWarning";
+
+  if (countdownInterval) clearInterval(countdownInterval);
+
+  function tick() {
+    const remainingMs = new Date(lockedUntilIso) - new Date();
+    if (remainingMs <= 0) {
+      clearInterval(countdownInterval);
+      countdownInterval = null;
+      msg.textContent = "";
+      msg.className = "";
+      pinInput.disabled = false;
+      pinBtn.disabled = false;
+      return;
+    }
+    const totalSeconds = Math.ceil(remainingMs / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    msg.textContent =
+      "Too many wrong attempts. Try again in " + minutes + "m " + String(seconds).padStart(2, "0") + "s.";
+  }
+
+  tick();
+  countdownInterval = setInterval(tick, 1000);
+}
 
 function showOnly(id) {
   ["setupSection", "loginSection", "otpSection", "pinSetupSection", "pinLoginSection"].forEach((sectionId) => {
@@ -745,12 +789,24 @@ async function loadStaffList() {
       selectedStaffId = person.id;
       document.getElementById("selectedStaffName").textContent = "Logging in as " + person.name;
       document.getElementById("pinPadSection").style.display = "block";
+
       const pinInput = document.getElementById("pinInput");
+      const msg = document.getElementById("pinLoginMsg");
       pinInput.value = "";
-      pinInput.disabled = false;
-      document.getElementById("pinLoginBtn").disabled = false;
-      document.getElementById("pinLoginMsg").textContent = "";
-      pinInput.focus();
+      msg.textContent = "";
+      msg.className = ""; // clear any leftover warning styling from a previous selection
+      if (countdownInterval) {
+        clearInterval(countdownInterval);
+        countdownInterval = null;
+      }
+
+      if (person.pin_locked_until && new Date(person.pin_locked_until) > new Date()) {
+        showLockCountdown(person.pin_locked_until);
+      } else {
+        pinInput.disabled = false;
+        document.getElementById("pinLoginBtn").disabled = false;
+        pinInput.focus();
+      }
     });
     container.appendChild(btn);
   });
@@ -769,14 +825,10 @@ document.getElementById("pinLoginBtn").addEventListener("click", async () => {
   const data = await res.json();
 
   if (!res.ok) {
-    msg.textContent = data.error;
-    if (res.status === 423) {
-      // Locked out -- disable the field entirely rather than just showing
-      // an error, so it's visually obvious retrying won't help right now.
-      msg.className = "lockWarning";
-      document.getElementById("pinInput").disabled = true;
-      document.getElementById("pinLoginBtn").disabled = true;
+    if (res.status === 423 && data.locked_until) {
+      showLockCountdown(data.locked_until);
     } else {
+      msg.textContent = data.error;
       msg.className = "error";
     }
     return;
@@ -788,6 +840,10 @@ document.getElementById("pinLoginBtn").addEventListener("click", async () => {
 
 document.getElementById("backToStaffList").addEventListener("click", () => {
   document.getElementById("pinPadSection").style.display = "none";
+  if (countdownInterval) {
+    clearInterval(countdownInterval);
+    countdownInterval = null;
+  }
 });
 
 document.getElementById("usePasswordInstead").addEventListener("click", () => showOnly("loginSection"));
