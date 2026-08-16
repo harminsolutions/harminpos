@@ -4,6 +4,7 @@ import {
   generateOTP,
   hashOTP,
   createSessionToken,
+  verifySessionToken,
   generateDeviceToken,
 } from "./auth.js";
 import { sendOTPEmail } from "./email.js";
@@ -49,6 +50,26 @@ function parseCookies(cookieHeader) {
   return cookies;
 }
 
+// Reads the session cookie, verifies it, and loads the current user from
+// the database. Returns null if not logged in, session expired, or the
+// account has since been deactivated.
+async function getCurrentUser(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  if (!cookies.session) return null;
+
+  const userId = await verifySessionToken(cookies.session, env.SESSION_SECRET);
+  if (!userId) return null;
+
+  const user = await env.DB.prepare(
+    "SELECT id, name, email, role, password_hash, pin_hash, is_active FROM users WHERE id = ?"
+  )
+    .bind(userId)
+    .first();
+
+  if (!user || !user.is_active) return null;
+  return user;
+}
+
 export default {
   async fetch(request, env) {
     try {
@@ -68,6 +89,14 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/verify-otp") {
         return handleVerifyOtp(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/me") {
+        return handleMe(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/set-pin") {
+        return handleSetPin(request, env);
       }
 
       return new Response("Not found", { status: 404 });
@@ -281,6 +310,61 @@ async function handleVerifyOtp(request, env) {
   return new Response(JSON.stringify({ success: true }), { headers });
 }
 
+async function handleMe(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  return jsonResponse({
+    id: currentUser.id,
+    name: currentUser.name,
+    email: currentUser.email,
+    role: currentUser.role,
+    has_pin: !!currentUser.pin_hash,
+  });
+}
+
+async function handleSetPin(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  const { password, pin } = await request.json();
+
+  if (!password || !pin) {
+    return jsonResponse({ error: "Password and PIN are required." }, 400);
+  }
+  if (!/^\d{6}$/.test(pin)) {
+    return jsonResponse({ error: "PIN must be exactly 6 digits." }, 400);
+  }
+
+  // Step-up check: setting a PIN is security-sensitive, so even though this
+  // user already has a valid session, we require the real password again
+  // before making the change -- same rule that will guard voids, refunds,
+  // and settings changes later.
+  const validPassword = await verifyPassword(password, currentUser.password_hash);
+  if (!validPassword) {
+    return jsonResponse({ error: "Incorrect password." }, 400);
+  }
+
+  const pinHash = await hashPassword(pin); // same PBKDF2 hashing reused for the PIN
+
+  await env.DB.prepare(
+    "UPDATE users SET pin_hash = ?, pin_failed_attempts = 0, pin_locked_until = NULL WHERE id = ?"
+  )
+    .bind(pinHash, currentUser.id)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'pin_set', 'user', ?)"
+  )
+    .bind(currentUser.id, currentUser.id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -298,7 +382,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .success { color: #27ae60; margin-top: 12px; font-size: 14px; }
   .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
   .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
-  #loginSection, #otpSection { display: none; }
+  #loginSection, #otpSection, #pinSetupSection { display: none; }
 </style>
 </head>
 <body>
@@ -336,11 +420,22 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div id="otpMsg"></div>
   </div>
 
+  <div id="pinSetupSection">
+    <h1>Set your PIN</h1>
+    <p class="sub">A 6-digit PIN lets you log in fast on this device next time, no email code needed.</p>
+    <label for="confirmPassword">Confirm your password</label>
+    <input id="confirmPassword" type="password" />
+    <label for="newPin">6-digit PIN</label>
+    <input id="newPin" type="text" maxlength="6" inputmode="numeric" />
+    <button id="setPinBtn">Save PIN</button>
+    <div id="pinSetupMsg"></div>
+  </div>
+
 <script>
 let pendingEmail = "";
 
 function showOnly(id) {
-  ["setupSection", "loginSection", "otpSection"].forEach((sectionId) => {
+  ["setupSection", "loginSection", "otpSection", "pinSetupSection"].forEach((sectionId) => {
     document.getElementById(sectionId).style.display = sectionId === id ? "block" : "none";
   });
 }
@@ -391,8 +486,7 @@ document.getElementById("loginBtn").addEventListener("click", async () => {
   }
 
   if (data.trusted) {
-    msg.textContent = "Logged in!";
-    msg.className = "success";
+    showOnly("pinSetupSection");
     return;
   }
 
@@ -418,7 +512,29 @@ document.getElementById("verifyBtn").addEventListener("click", async () => {
     return;
   }
 
-  msg.textContent = "Logged in! This device is now trusted.";
+  showOnly("pinSetupSection");
+});
+
+document.getElementById("setPinBtn").addEventListener("click", async () => {
+  const password = document.getElementById("confirmPassword").value;
+  const pin = document.getElementById("newPin").value.trim();
+  const msg = document.getElementById("pinSetupMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/set-pin", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ password, pin }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "PIN saved! Next time this device offers a fast PIN login.";
   msg.className = "success";
 });
 </script>
