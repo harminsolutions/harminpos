@@ -126,6 +126,22 @@ export default {
         return handleCreateSale(request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/shifts/open") {
+        return handleOpenShift(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/shifts/close") {
+        return handleCloseShift(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/shifts/current") {
+        return handleCurrentShift(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/reports/summary") {
+        return handleReportsSummary(request, env);
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (err) {
       // Catches anything unexpected so the browser always gets readable JSON
@@ -558,7 +574,7 @@ async function handleCreateProduct(request, env) {
   }
 
   const body = await request.json();
-  const { name, item_type, unit_price, sku, stock_quantity, sst_applicable, sst_rate } = body;
+  const { name, item_type, unit_price, cost_price, sku, stock_quantity, sst_applicable, sst_rate } = body;
 
   if (!name || !item_type || unit_price === undefined || unit_price === null || unit_price === "") {
     return jsonResponse({ error: "Name, type, and price are required." }, 400);
@@ -571,6 +587,8 @@ async function handleCreateProduct(request, env) {
   if (priceSen === null || priceSen < 0) {
     return jsonResponse({ error: "Enter a valid price." }, 400);
   }
+
+  const costSen = cost_price !== undefined && cost_price !== "" ? ringgitToSen(cost_price) : null;
 
   if (sku) {
     const existingSku = await env.DB.prepare("SELECT id FROM products WHERE sku = ?").bind(sku).first();
@@ -585,10 +603,10 @@ async function handleCreateProduct(request, env) {
   const sstRateValue = sstApplicable ? Number(sst_rate) || 0 : null;
 
   const result = await env.DB.prepare(
-    `INSERT INTO products (sku, name, item_type, unit_price, stock_quantity, sst_applicable, sst_rate)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO products (sku, name, item_type, unit_price, cost_price, stock_quantity, sst_applicable, sst_rate)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(sku || null, name, item_type, priceSen, stockValue, sstApplicable, sstRateValue)
+    .bind(sku || null, name, item_type, priceSen, costSen, stockValue, sstApplicable, sstRateValue)
     .run();
 
   await env.DB.prepare(
@@ -604,6 +622,15 @@ async function handleCreateSale(request, env) {
   const currentUser = await getCurrentUser(request, env);
   if (!currentUser) {
     return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  // A sale has to belong to a shift -- otherwise cash reconciliation at
+  // shift close can't account for it.
+  const openShift = await env.DB.prepare("SELECT id FROM cash_shifts WHERE cashier_id = ? AND status = 'open'")
+    .bind(currentUser.id)
+    .first();
+  if (!openShift) {
+    return jsonResponse({ error: "Open a shift before making sales." }, 400);
   }
 
   const body = await request.json();
@@ -672,10 +699,20 @@ async function handleCreateSale(request, env) {
   // completed immediately -- swapping in real DuitNow QR/card confirmation
   // later just changes this one line, not the rest of the checkout flow.
   const saleResult = await env.DB.prepare(
-    `INSERT INTO sales (receipt_number, cashier_id, customer_id, subtotal, sst_amount, discount_amount, total_amount, payment_method, payment_status, einvoice_status, created_at)
-     VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'completed', 'not_required', ?)`
+    `INSERT INTO sales (receipt_number, cashier_id, shift_id, customer_id, subtotal, sst_amount, discount_amount, total_amount, payment_method, payment_status, einvoice_status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'completed', 'not_required', ?)`
   )
-    .bind(receiptNumber, currentUser.id, customer_id || null, subtotal, sstAmount, totalAmount, payment_method, now)
+    .bind(
+      receiptNumber,
+      currentUser.id,
+      openShift.id,
+      customer_id || null,
+      subtotal,
+      sstAmount,
+      totalAmount,
+      payment_method,
+      now
+    )
     .run();
 
   const saleId = saleResult.meta.last_row_id;
@@ -720,6 +757,158 @@ async function handleCreateSale(request, env) {
   });
 }
 
+async function handleOpenShift(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  const existingOpen = await env.DB.prepare("SELECT id FROM cash_shifts WHERE cashier_id = ? AND status = 'open'")
+    .bind(currentUser.id)
+    .first();
+  if (existingOpen) {
+    return jsonResponse({ error: "You already have an open shift." }, 400);
+  }
+
+  const body = await request.json();
+  const openingCashSen = ringgitToSen(body.opening_cash);
+  if (openingCashSen === null || openingCashSen < 0) {
+    return jsonResponse({ error: "Enter a valid starting cash amount." }, 400);
+  }
+
+  // Set opened_at explicitly rather than relying on the schema's default --
+  // keeps every timestamp in this app in the same ISO format, since
+  // SQLite's own CURRENT_TIMESTAMP uses a different format that browsers
+  // don't always parse consistently.
+  const now = new Date().toISOString();
+
+  const result = await env.DB.prepare(
+    "INSERT INTO cash_shifts (cashier_id, opening_cash, status, opened_at) VALUES (?, ?, 'open', ?)"
+  )
+    .bind(currentUser.id, openingCashSen, now)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'shift_opened', 'cash_shift', ?)"
+  )
+    .bind(currentUser.id, result.meta.last_row_id)
+    .run();
+
+  return jsonResponse({ success: true, shift_id: result.meta.last_row_id });
+}
+
+async function handleCloseShift(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  const shift = await env.DB.prepare(
+    "SELECT id, opening_cash FROM cash_shifts WHERE cashier_id = ? AND status = 'open'"
+  )
+    .bind(currentUser.id)
+    .first();
+  if (!shift) {
+    return jsonResponse({ error: "You don't have an open shift." }, 400);
+  }
+
+  const body = await request.json();
+  const actualCashSen = ringgitToSen(body.closing_cash_actual);
+  if (actualCashSen === null || actualCashSen < 0) {
+    return jsonResponse({ error: "Enter a valid counted cash amount." }, 400);
+  }
+
+  // Expected cash = starting float + every cash sale recorded during this
+  // shift. Card/QR sales don't affect the physical till, so they're
+  // excluded from this check entirely.
+  const cashSalesRow = await env.DB.prepare(
+    "SELECT COALESCE(SUM(total_amount), 0) as total FROM sales WHERE shift_id = ? AND payment_method = 'cash' AND is_voided = 0"
+  )
+    .bind(shift.id)
+    .first();
+
+  const expected = shift.opening_cash + cashSalesRow.total;
+  const discrepancy = actualCashSen - expected;
+  const now = new Date().toISOString();
+
+  await env.DB.prepare(
+    `UPDATE cash_shifts SET status = 'closed', closing_cash_expected = ?, closing_cash_actual = ?, discrepancy = ?, closed_at = ?
+     WHERE id = ?`
+  )
+    .bind(expected, actualCashSen, discrepancy, now, shift.id)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'shift_closed', 'cash_shift', ?)"
+  )
+    .bind(currentUser.id, shift.id)
+    .run();
+
+  return jsonResponse({
+    success: true,
+    expected: senToRinggit(expected),
+    actual: senToRinggit(actualCashSen),
+    discrepancy: senToRinggit(discrepancy),
+  });
+}
+
+async function handleCurrentShift(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  const shift = await env.DB.prepare(
+    "SELECT id, opening_cash FROM cash_shifts WHERE cashier_id = ? AND status = 'open'"
+  )
+    .bind(currentUser.id)
+    .first();
+
+  if (!shift) {
+    return jsonResponse({ open: false });
+  }
+
+  return jsonResponse({ open: true, shift_id: shift.id, opening_cash: senToRinggit(shift.opening_cash) });
+}
+
+async function handleReportsSummary(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view reports." }, 403);
+  }
+
+  // "Today" is calculated in UTC here, which can run up to 8 hours behind
+  // Malaysia time -- close enough for a first version, but worth knowing
+  // if a late-night sale ever looks like it landed on the wrong day.
+  const todayStart = new Date();
+  todayStart.setUTCHours(0, 0, 0, 0);
+  const todayStartIso = todayStart.toISOString();
+
+  const salesRow = await env.DB.prepare(
+    "SELECT COUNT(*) as sale_count, COALESCE(SUM(total_amount), 0) as revenue FROM sales WHERE is_voided = 0 AND created_at >= ?"
+  )
+    .bind(todayStartIso)
+    .first();
+
+  const profitRow = await env.DB.prepare(
+    `SELECT COALESCE(SUM((si.unit_price_snapshot - COALESCE(si.cost_price_snapshot, 0)) * si.quantity), 0) as profit
+     FROM sale_items si
+     JOIN sales s ON s.id = si.sale_id
+     WHERE s.is_voided = 0 AND s.created_at >= ?`
+  )
+    .bind(todayStartIso)
+    .first();
+
+  return jsonResponse({
+    sale_count: salesRow.sale_count,
+    revenue: senToRinggit(salesRow.revenue),
+    profit: senToRinggit(profitRow.profit),
+  });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -740,6 +929,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
   .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
   #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection, #dashboardSection { display: none; }
+  #productsTab, #reportsTab, #shiftOpenView { display: none; }
   .staffBtn { text-align: left; background: white; color: #1a1a1a; border: 1px solid #ccc; margin-top: 8px; }
   #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid #eee; }
   h2.sectionTitle { font-size: 15px; margin-top: 32px; margin-bottom: 4px; }
@@ -825,9 +1015,30 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div class="tabBar">
       <button id="tabCheckoutBtn" class="tabBtn">Checkout</button>
       <button id="tabProductsBtn" class="tabBtn">Products</button>
+      <button id="tabReportsBtn" class="tabBtn">Reports</button>
     </div>
 
     <div id="checkoutTab">
+      <div id="shiftClosedView">
+        <h2 class="sectionTitle">Open your shift</h2>
+        <p class="sub">Count your starting cash before you can make sales.</p>
+        <label for="openingCash">Starting cash (RM)</label>
+        <input id="openingCash" type="number" step="0.01" min="0" />
+        <button id="openShiftBtn">Open shift</button>
+        <div id="openShiftMsg"></div>
+      </div>
+
+      <div id="shiftOpenView">
+        <p class="sub" id="shiftStatusText"></p>
+        <button id="closeShiftBtn" class="smallBtn" style="margin-left: 0;">Close shift</button>
+        <div id="closeShiftForm" style="display: none; margin-top: 16px;">
+          <label for="closingCash">Counted cash (RM)</label>
+          <input id="closingCash" type="number" step="0.01" min="0" />
+          <button id="confirmCloseShiftBtn">Confirm close</button>
+        </div>
+        <div id="closeShiftMsg"></div>
+      </div>
+
       <h2 class="sectionTitle">Tap to add</h2>
       <div id="checkoutProductList"></div>
 
@@ -867,6 +1078,8 @@ const HTML_PAGE = `<!DOCTYPE html>
         </select>
         <label for="prodPrice">Price (RM)</label>
         <input id="prodPrice" type="number" step="0.01" min="0" />
+        <label for="prodCost">Cost price (RM, optional)</label>
+        <input id="prodCost" type="number" step="0.01" min="0" />
         <label for="prodSku">SKU (optional)</label>
         <input id="prodSku" type="text" />
         <div id="stockFields">
@@ -882,6 +1095,13 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div id="addProductMsg"></div>
       </div>
     </div>
+
+    <div id="reportsTab">
+      <h2 class="sectionTitle">Today</h2>
+      <div class="productRow"><span>Sales</span><span id="reportSaleCount"></span></div>
+      <div class="productRow"><span>Revenue</span><span id="reportRevenue"></span></div>
+      <div class="productRow totalRow"><span>Profit</span><span id="reportProfit"></span></div>
+    </div>
   </div>
 
 <script>
@@ -894,12 +1114,16 @@ let allProducts = [];
 function showTab(tab) {
   document.getElementById("checkoutTab").style.display = tab === "checkout" ? "block" : "none";
   document.getElementById("productsTab").style.display = tab === "products" ? "block" : "none";
+  document.getElementById("reportsTab").style.display = tab === "reports" ? "block" : "none";
   document.getElementById("tabCheckoutBtn").className = "tabBtn" + (tab === "checkout" ? " active" : "");
   document.getElementById("tabProductsBtn").className = "tabBtn" + (tab === "products" ? " active" : "");
+  document.getElementById("tabReportsBtn").className = "tabBtn" + (tab === "reports" ? " active" : "");
+  if (tab === "reports") loadReports();
 }
 
 document.getElementById("tabCheckoutBtn").addEventListener("click", () => showTab("checkout"));
 document.getElementById("tabProductsBtn").addEventListener("click", () => showTab("products"));
+document.getElementById("tabReportsBtn").addEventListener("click", () => showTab("reports"));
 
 // Ticks down a lockout countdown using the real server timestamp, so it
 // shows the correct remaining time even after a page refresh -- refreshing
@@ -1142,11 +1366,14 @@ document.getElementById("usePasswordInstead").addEventListener("click", () => sh
 async function loadDashboard() {
   const me = await fetch("/api/me").then((r) => r.json());
   document.getElementById("welcomeMsg").textContent = "Logged in as " + me.name + " (" + me.role + ")";
-  // Cashiers live on the Checkout tab -- product management isn't their job.
+  // Cashiers live on the Checkout tab -- product management and business
+  // reports aren't their job.
   document.getElementById("tabProductsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
+  document.getElementById("tabReportsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
   cart = [];
   renderCart();
   await loadProducts();
+  await loadShiftStatus();
   showTab("checkout");
   showOnly("dashboardSection");
 }
@@ -1214,6 +1441,7 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
   const name = document.getElementById("prodName").value.trim();
   const item_type = document.getElementById("prodType").value;
   const unit_price = document.getElementById("prodPrice").value;
+  const cost_price = document.getElementById("prodCost").value;
   const sku = document.getElementById("prodSku").value.trim();
   const stock_quantity = document.getElementById("prodStock").value;
   const sstApplicable = document.getElementById("prodSstApplicable").checked;
@@ -1228,6 +1456,7 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
       name,
       item_type,
       unit_price,
+      cost_price: cost_price || undefined,
       sku: sku || undefined,
       stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
       sst_applicable: sstApplicable,
@@ -1246,6 +1475,7 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
   msg.className = "success";
   document.getElementById("prodName").value = "";
   document.getElementById("prodPrice").value = "";
+  document.getElementById("prodCost").value = "";
   document.getElementById("prodSku").value = "";
   document.getElementById("prodStock").value = "";
   document.getElementById("prodSstApplicable").checked = false;
@@ -1375,6 +1605,84 @@ function showReceipt(sale) {
 document.getElementById("newSaleBtn").addEventListener("click", () => {
   document.getElementById("receiptSection").style.display = "none";
 });
+
+async function loadShiftStatus() {
+  const res = await fetch("/api/shifts/current");
+  const data = await res.json();
+
+  if (data.open) {
+    document.getElementById("shiftClosedView").style.display = "none";
+    document.getElementById("shiftOpenView").style.display = "block";
+    document.getElementById("shiftStatusText").textContent =
+      "Shift open -- starting cash RM " + data.opening_cash;
+    document.getElementById("checkoutBtn").disabled = false;
+  } else {
+    document.getElementById("shiftClosedView").style.display = "block";
+    document.getElementById("shiftOpenView").style.display = "none";
+    document.getElementById("checkoutBtn").disabled = true;
+  }
+}
+
+document.getElementById("openShiftBtn").addEventListener("click", async () => {
+  const opening_cash = document.getElementById("openingCash").value;
+  const msg = document.getElementById("openShiftMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/shifts/open", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ opening_cash }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  document.getElementById("openingCash").value = "";
+  await loadShiftStatus();
+});
+
+document.getElementById("closeShiftBtn").addEventListener("click", () => {
+  document.getElementById("closeShiftForm").style.display = "block";
+});
+
+document.getElementById("confirmCloseShiftBtn").addEventListener("click", async () => {
+  const closing_cash_actual = document.getElementById("closingCash").value;
+  const msg = document.getElementById("closeShiftMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/shifts/close", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ closing_cash_actual }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent =
+    "Shift closed. Expected RM " + data.expected + ", counted RM " + data.actual + ", difference RM " + data.discrepancy + ".";
+  msg.className = data.discrepancy === "0.00" ? "success" : "error";
+  document.getElementById("closingCash").value = "";
+  document.getElementById("closeShiftForm").style.display = "none";
+  await loadShiftStatus();
+});
+
+async function loadReports() {
+  const res = await fetch("/api/reports/summary");
+  const data = await res.json();
+  if (!res.ok) return;
+  document.getElementById("reportSaleCount").textContent = data.sale_count;
+  document.getElementById("reportRevenue").textContent = "RM " + data.revenue;
+  document.getElementById("reportProfit").textContent = "RM " + data.profit;
+}
 
 checkDeviceStatus();
 </script>
