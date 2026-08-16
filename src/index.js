@@ -651,7 +651,13 @@ document.getElementById("loginBtn").addEventListener("click", async () => {
   }
 
   if (data.trusted) {
-    showOnly("pinSetupSection");
+    const me = await fetch("/api/me").then((r) => r.json());
+    if (me.has_pin) {
+      msg.textContent = "Logged in!";
+      msg.className = "success";
+    } else {
+      showOnly("pinSetupSection");
+    }
     return;
   }
 
@@ -677,7 +683,13 @@ document.getElementById("verifyBtn").addEventListener("click", async () => {
     return;
   }
 
-  showOnly("pinSetupSection");
+  const me = await fetch("/api/me").then((r) => r.json());
+  if (me.has_pin) {
+    msg.textContent = "Logged in! This device is now trusted.";
+    msg.className = "success";
+  } else {
+    showOnly("pinSetupSection");
+  }
 });
 
 document.getElementById("setPinBtn").addEventListener("click", async () => {
