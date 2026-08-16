@@ -752,6 +752,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   .smallBtn { width: auto; margin: 0 0 0 12px; padding: 4px 12px; font-size: 13px; }
   #receiptSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 2px solid #1a1a1a; }
   .totalRow { font-weight: 600; }
+  .tabBar { display: flex; gap: 4px; margin: 24px 0 8px; border-bottom: 1px solid #ddd; }
+  .tabBtn { width: auto; background: none; color: #888; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 10px 4px; margin: 0 16px 0 0; font-weight: 600; font-size: 14px; }
+  .tabBtn.active { color: #1a1a1a; border-bottom-color: #1a1a1a; }
 </style>
 </head>
 <body>
@@ -819,53 +822,65 @@ const HTML_PAGE = `<!DOCTYPE html>
     <h1>HarminPOS</h1>
     <p class="sub" id="welcomeMsg"></p>
 
-    <h2 class="sectionTitle">Products</h2>
-    <div id="productList"></div>
-
-    <h2 class="sectionTitle">New Sale</h2>
-    <div id="cartItems"></div>
-    <div id="cartTotals"></div>
-    <label for="paymentMethod">Payment method</label>
-    <select id="paymentMethod">
-      <option value="cash">Cash</option>
-      <option value="duitnow_qr">DuitNow QR</option>
-      <option value="card">Card</option>
-    </select>
-    <button id="checkoutBtn">Complete sale</button>
-    <div id="checkoutMsg"></div>
-
-    <div id="receiptSection">
-      <h2 class="sectionTitle">Sale complete</h2>
-      <p class="sub">Receipt <span id="receiptNumber"></span></p>
-      <div id="receiptItems"></div>
-      <div class="productRow totalRow"><span>Total</span><span id="receiptTotal"></span></div>
-      <button id="newSaleBtn">New sale</button>
+    <div class="tabBar">
+      <button id="tabCheckoutBtn" class="tabBtn">Checkout</button>
+      <button id="tabProductsBtn" class="tabBtn">Products</button>
     </div>
 
-    <div id="addProductSection">
-      <h2 class="sectionTitle">Add a product</h2>
-      <label for="prodName">Name</label>
-      <input id="prodName" type="text" />
-      <label for="prodType">Type</label>
-      <select id="prodType">
-        <option value="goods">Goods (physical item)</option>
-        <option value="service">Service</option>
+    <div id="checkoutTab">
+      <h2 class="sectionTitle">Tap to add</h2>
+      <div id="checkoutProductList"></div>
+
+      <h2 class="sectionTitle">Cart</h2>
+      <div id="cartItems"></div>
+      <div id="cartTotals"></div>
+      <label for="paymentMethod">Payment method</label>
+      <select id="paymentMethod">
+        <option value="cash">Cash</option>
+        <option value="duitnow_qr">DuitNow QR</option>
+        <option value="card">Card</option>
       </select>
-      <label for="prodPrice">Price (RM)</label>
-      <input id="prodPrice" type="number" step="0.01" min="0" />
-      <label for="prodSku">SKU (optional)</label>
-      <input id="prodSku" type="text" />
-      <div id="stockFields">
-        <label for="prodStock">Stock quantity</label>
-        <input id="prodStock" type="number" min="0" />
+      <button id="checkoutBtn">Complete sale</button>
+      <div id="checkoutMsg"></div>
+
+      <div id="receiptSection">
+        <h2 class="sectionTitle">Sale complete</h2>
+        <p class="sub">Receipt <span id="receiptNumber"></span></p>
+        <div id="receiptItems"></div>
+        <div class="productRow totalRow"><span>Total</span><span id="receiptTotal"></span></div>
+        <button id="newSaleBtn">New sale</button>
       </div>
-      <label class="inlineLabel"><input type="checkbox" id="prodSstApplicable" /> SST applicable</label>
-      <div id="sstRateField" style="display: none;">
-        <label for="prodSstRate">SST rate (%)</label>
-        <input id="prodSstRate" type="number" step="0.01" min="0" max="100" placeholder="e.g. 6" />
+    </div>
+
+    <div id="productsTab">
+      <h2 class="sectionTitle">All products</h2>
+      <div id="manageProductList"></div>
+
+      <div id="addProductSection">
+        <h2 class="sectionTitle">Add a product</h2>
+        <label for="prodName">Name</label>
+        <input id="prodName" type="text" />
+        <label for="prodType">Type</label>
+        <select id="prodType">
+          <option value="goods">Goods (physical item)</option>
+          <option value="service">Service</option>
+        </select>
+        <label for="prodPrice">Price (RM)</label>
+        <input id="prodPrice" type="number" step="0.01" min="0" />
+        <label for="prodSku">SKU (optional)</label>
+        <input id="prodSku" type="text" />
+        <div id="stockFields">
+          <label for="prodStock">Stock quantity</label>
+          <input id="prodStock" type="number" min="0" />
+        </div>
+        <label class="inlineLabel"><input type="checkbox" id="prodSstApplicable" /> SST applicable</label>
+        <div id="sstRateField" style="display: none;">
+          <label for="prodSstRate">SST rate (%)</label>
+          <input id="prodSstRate" type="number" step="0.01" min="0" max="100" placeholder="e.g. 6" />
+        </div>
+        <button id="addProductBtn">Add product</button>
+        <div id="addProductMsg"></div>
       </div>
-      <button id="addProductBtn">Add product</button>
-      <div id="addProductMsg"></div>
     </div>
   </div>
 
@@ -874,6 +889,17 @@ let pendingEmail = "";
 let selectedStaffId = null;
 let countdownInterval = null;
 let cart = [];
+let allProducts = [];
+
+function showTab(tab) {
+  document.getElementById("checkoutTab").style.display = tab === "checkout" ? "block" : "none";
+  document.getElementById("productsTab").style.display = tab === "products" ? "block" : "none";
+  document.getElementById("tabCheckoutBtn").className = "tabBtn" + (tab === "checkout" ? " active" : "");
+  document.getElementById("tabProductsBtn").className = "tabBtn" + (tab === "products" ? " active" : "");
+}
+
+document.getElementById("tabCheckoutBtn").addEventListener("click", () => showTab("checkout"));
+document.getElementById("tabProductsBtn").addEventListener("click", () => showTab("products"));
 
 // Ticks down a lockout countdown using the real server timestamp, so it
 // shows the correct remaining time even after a page refresh -- refreshing
@@ -1116,27 +1142,33 @@ document.getElementById("usePasswordInstead").addEventListener("click", () => sh
 async function loadDashboard() {
   const me = await fetch("/api/me").then((r) => r.json());
   document.getElementById("welcomeMsg").textContent = "Logged in as " + me.name + " (" + me.role + ")";
-  // Cashiers can see products at checkout later, but shouldn't see the
-  // add-product form -- that's staff/admin/owner territory.
-  document.getElementById("addProductSection").style.display = me.role === "cashier" ? "none" : "block";
+  // Cashiers live on the Checkout tab -- product management isn't their job.
+  document.getElementById("tabProductsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
   cart = [];
   renderCart();
   await loadProducts();
+  showTab("checkout");
   showOnly("dashboardSection");
 }
 
 async function loadProducts() {
   const res = await fetch("/api/products");
   const data = await res.json();
-  const container = document.getElementById("productList");
+  allProducts = data.products || [];
+  renderCheckoutProductList();
+  renderManageProductList();
+}
+
+function renderCheckoutProductList() {
+  const container = document.getElementById("checkoutProductList");
   container.innerHTML = "";
 
-  if (!data.products || data.products.length === 0) {
-    container.innerHTML = '<p class="sub">No products yet.</p>';
+  if (allProducts.length === 0) {
+    container.innerHTML = '<p class="sub">No products yet -- add one in the Products tab.</p>';
     return;
   }
 
-  data.products.forEach((p) => {
+  allProducts.forEach((p) => {
     const row = document.createElement("div");
     row.className = "productRow";
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
@@ -1147,6 +1179,25 @@ async function loadProducts() {
     addBtn.className = "smallBtn";
     addBtn.addEventListener("click", () => addToCart(p));
     row.appendChild(addBtn);
+    container.appendChild(row);
+  });
+}
+
+function renderManageProductList() {
+  const container = document.getElementById("manageProductList");
+  container.innerHTML = "";
+
+  if (allProducts.length === 0) {
+    container.innerHTML = '<p class="sub">No products yet.</p>';
+    return;
+  }
+
+  allProducts.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
+    row.innerHTML =
+      "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
     container.appendChild(row);
   });
 }
