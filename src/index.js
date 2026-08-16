@@ -8,6 +8,7 @@ import {
   generateDeviceToken,
 } from "./auth.js";
 import { sendOTPEmail } from "./email.js";
+import { ringgitToSen, senToRinggit } from "./money.js";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
 const MAX_PIN_ATTEMPTS = 5;
@@ -111,6 +112,14 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/pin-login") {
         return handlePinLogin(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/products") {
+        return handleListProducts(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/products") {
+        return handleCreateProduct(request, env);
       }
 
       return new Response("Not found", { status: 404 });
@@ -518,6 +527,73 @@ async function handlePinLogin(request, env) {
   return new Response(JSON.stringify({ success: true }), { headers });
 }
 
+async function handleListProducts(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  // No role restriction here -- cashiers need to see products to sell
+  // them at checkout, same as everyone else.
+  const { results } = await env.DB.prepare(
+    `SELECT id, sku, name, item_type, unit_price, unit_of_measure, stock_quantity, reorder_level
+     FROM products WHERE is_active = 1 ORDER BY name`
+  ).all();
+
+  const products = results.map((p) => ({ ...p, unit_price_display: senToRinggit(p.unit_price) }));
+  return jsonResponse({ products });
+}
+
+async function handleCreateProduct(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage products." }, 403);
+  }
+
+  const body = await request.json();
+  const { name, item_type, unit_price, sku, stock_quantity } = body;
+
+  if (!name || !item_type || unit_price === undefined || unit_price === null || unit_price === "") {
+    return jsonResponse({ error: "Name, type, and price are required." }, 400);
+  }
+  if (!["goods", "service"].includes(item_type)) {
+    return jsonResponse({ error: "Item type must be goods or service." }, 400);
+  }
+
+  const priceSen = ringgitToSen(unit_price);
+  if (priceSen === null || priceSen < 0) {
+    return jsonResponse({ error: "Enter a valid price." }, 400);
+  }
+
+  if (sku) {
+    const existingSku = await env.DB.prepare("SELECT id FROM products WHERE sku = ?").bind(sku).first();
+    if (existingSku) {
+      return jsonResponse({ error: "That SKU is already used by another product." }, 400);
+    }
+  }
+
+  // Stock tracking only applies to physical goods -- services stay NULL.
+  const stockValue = item_type === "goods" ? Number(stock_quantity) || 0 : null;
+
+  const result = await env.DB.prepare(
+    `INSERT INTO products (sku, name, item_type, unit_price, stock_quantity)
+     VALUES (?, ?, ?, ?, ?)`
+  )
+    .bind(sku || null, name, item_type, priceSen, stockValue)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'product_created', 'product', ?)"
+  )
+    .bind(currentUser.id, result.meta.last_row_id)
+    .run();
+
+  return jsonResponse({ success: true, id: result.meta.last_row_id });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -525,7 +601,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>HarminPOS</title>
 <style>
-  body { font-family: system-ui, sans-serif; max-width: 400px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
+  body { font-family: system-ui, sans-serif; max-width: 600px; margin: 60px auto; padding: 0 20px; color: #1a1a1a; }
   h1 { font-size: 20px; margin-bottom: 4px; }
   p.sub { color: #666; margin-top: 0; margin-bottom: 24px; }
   label { display: block; margin-top: 16px; margin-bottom: 4px; font-size: 14px; font-weight: 600; }
@@ -537,9 +613,14 @@ const HTML_PAGE = `<!DOCTYPE html>
   input:disabled, button:disabled { opacity: 0.5; cursor: not-allowed; }
   .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
   .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
-  #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection { display: none; }
+  #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection, #dashboardSection { display: none; }
   .staffBtn { text-align: left; background: white; color: #1a1a1a; border: 1px solid #ccc; margin-top: 8px; }
   #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid #eee; }
+  h2.sectionTitle { font-size: 15px; margin-top: 32px; margin-bottom: 4px; }
+  .productRow { display: flex; justify-content: space-between; padding: 10px 0; border-bottom: 1px solid #eee; font-size: 14px; }
+  .productRow span:first-child { flex: 1; }
+  .productRow span { color: #444; }
+  select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
 </style>
 </head>
 <body>
@@ -603,6 +684,35 @@ const HTML_PAGE = `<!DOCTYPE html>
     <p class="toggle"><a id="usePasswordInstead">Use password instead</a></p>
   </div>
 
+  <div id="dashboardSection">
+    <h1>HarminPOS</h1>
+    <p class="sub" id="welcomeMsg"></p>
+
+    <h2 class="sectionTitle">Products</h2>
+    <div id="productList"></div>
+
+    <div id="addProductSection">
+      <h2 class="sectionTitle">Add a product</h2>
+      <label for="prodName">Name</label>
+      <input id="prodName" type="text" />
+      <label for="prodType">Type</label>
+      <select id="prodType">
+        <option value="goods">Goods (physical item)</option>
+        <option value="service">Service</option>
+      </select>
+      <label for="prodPrice">Price (RM)</label>
+      <input id="prodPrice" type="number" step="0.01" min="0" />
+      <label for="prodSku">SKU (optional)</label>
+      <input id="prodSku" type="text" />
+      <div id="stockFields">
+        <label for="prodStock">Stock quantity</label>
+        <input id="prodStock" type="number" min="0" />
+      </div>
+      <button id="addProductBtn">Add product</button>
+      <div id="addProductMsg"></div>
+    </div>
+  </div>
+
 <script>
 let pendingEmail = "";
 let selectedStaffId = null;
@@ -646,9 +756,11 @@ function showLockCountdown(lockedUntilIso) {
 }
 
 function showOnly(id) {
-  ["setupSection", "loginSection", "otpSection", "pinSetupSection", "pinLoginSection"].forEach((sectionId) => {
-    document.getElementById(sectionId).style.display = sectionId === id ? "block" : "none";
-  });
+  ["setupSection", "loginSection", "otpSection", "pinSetupSection", "pinLoginSection", "dashboardSection"].forEach(
+    (sectionId) => {
+      document.getElementById(sectionId).style.display = sectionId === id ? "block" : "none";
+    }
+  );
 }
 
 document.getElementById("showLogin").addEventListener("click", () => showOnly("loginSection"));
@@ -699,8 +811,7 @@ document.getElementById("loginBtn").addEventListener("click", async () => {
   if (data.trusted) {
     const me = await fetch("/api/me").then((r) => r.json());
     if (me.has_pin) {
-      msg.textContent = "Logged in!";
-      msg.className = "success";
+      await loadDashboard();
     } else {
       showOnly("pinSetupSection");
     }
@@ -731,8 +842,7 @@ document.getElementById("verifyBtn").addEventListener("click", async () => {
 
   const me = await fetch("/api/me").then((r) => r.json());
   if (me.has_pin) {
-    msg.textContent = "Logged in! This device is now trusted.";
-    msg.className = "success";
+    await loadDashboard();
   } else {
     showOnly("pinSetupSection");
   }
@@ -757,8 +867,7 @@ document.getElementById("setPinBtn").addEventListener("click", async () => {
     return;
   }
 
-  msg.textContent = "PIN saved! Next time this device offers a fast PIN login.";
-  msg.className = "success";
+  await loadDashboard();
 });
 
 async function checkDeviceStatus() {
@@ -834,8 +943,7 @@ document.getElementById("pinLoginBtn").addEventListener("click", async () => {
     return;
   }
 
-  msg.textContent = "Logged in!";
-  msg.className = "success";
+  await loadDashboard();
 });
 
 document.getElementById("backToStaffList").addEventListener("click", () => {
@@ -847,6 +955,78 @@ document.getElementById("backToStaffList").addEventListener("click", () => {
 });
 
 document.getElementById("usePasswordInstead").addEventListener("click", () => showOnly("loginSection"));
+
+async function loadDashboard() {
+  const me = await fetch("/api/me").then((r) => r.json());
+  document.getElementById("welcomeMsg").textContent = "Logged in as " + me.name + " (" + me.role + ")";
+  // Cashiers can see products at checkout later, but shouldn't see the
+  // add-product form -- that's staff/admin/owner territory.
+  document.getElementById("addProductSection").style.display = me.role === "cashier" ? "none" : "block";
+  await loadProducts();
+  showOnly("dashboardSection");
+}
+
+async function loadProducts() {
+  const res = await fetch("/api/products");
+  const data = await res.json();
+  const container = document.getElementById("productList");
+  container.innerHTML = "";
+
+  if (!data.products || data.products.length === 0) {
+    container.innerHTML = '<p class="sub">No products yet.</p>';
+    return;
+  }
+
+  data.products.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
+    row.innerHTML =
+      "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
+    container.appendChild(row);
+  });
+}
+
+document.getElementById("prodType").addEventListener("change", (e) => {
+  document.getElementById("stockFields").style.display = e.target.value === "goods" ? "block" : "none";
+});
+
+document.getElementById("addProductBtn").addEventListener("click", async () => {
+  const name = document.getElementById("prodName").value.trim();
+  const item_type = document.getElementById("prodType").value;
+  const unit_price = document.getElementById("prodPrice").value;
+  const sku = document.getElementById("prodSku").value.trim();
+  const stock_quantity = document.getElementById("prodStock").value;
+  const msg = document.getElementById("addProductMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/products", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      name,
+      item_type,
+      unit_price,
+      sku: sku || undefined,
+      stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
+    }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Product added!";
+  msg.className = "success";
+  document.getElementById("prodName").value = "";
+  document.getElementById("prodPrice").value = "";
+  document.getElementById("prodSku").value = "";
+  document.getElementById("prodStock").value = "";
+  await loadProducts();
+});
 
 checkDeviceStatus();
 </script>
