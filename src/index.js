@@ -10,6 +10,8 @@ import {
 import { sendOTPEmail } from "./email.js";
 
 const OTP_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const MAX_PIN_ATTEMPTS = 5;
+const PIN_LOCKOUT_MS = 15 * 60 * 1000; // 15 minutes
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -97,6 +99,18 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/set-pin") {
         return handleSetPin(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/device-status") {
+        return handleDeviceStatus(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/staff-list") {
+        return handleStaffList(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/pin-login") {
+        return handlePinLogin(request, env);
       }
 
       return new Response("Not found", { status: 404 });
@@ -365,6 +379,139 @@ async function handleSetPin(request, env) {
   return jsonResponse({ success: true });
 }
 
+async function handleDeviceStatus(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  let trusted = false;
+  if (cookies.device) {
+    const trustedDevice = await env.DB.prepare(
+      "SELECT id FROM trusted_devices WHERE device_token = ? AND is_active = 1"
+    )
+      .bind(cookies.device)
+      .first();
+    trusted = !!trustedDevice;
+  }
+
+  // Also tells the frontend whether an owner exists yet, so an untrusted
+  // device shows the login form by default instead of always defaulting
+  // to the one-time setup form.
+  const owner = await env.DB.prepare("SELECT id FROM users WHERE role = 'owner' LIMIT 1").first();
+
+  return jsonResponse({ trusted, owner_exists: !!owner });
+}
+
+async function handleStaffList(request, env) {
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const trustedDevice = cookies.device
+    ? await env.DB.prepare("SELECT id FROM trusted_devices WHERE device_token = ? AND is_active = 1")
+        .bind(cookies.device)
+        .first()
+    : null;
+
+  if (!trustedDevice) {
+    return jsonResponse({ error: "This device isn't trusted." }, 403);
+  }
+
+  // Only staff who have actually set a PIN show up here -- no point
+  // offering a picker option that can't log in.
+  const { results } = await env.DB.prepare(
+    "SELECT id, name, role FROM users WHERE is_active = 1 AND pin_hash IS NOT NULL ORDER BY name"
+  ).all();
+
+  return jsonResponse({ staff: results });
+}
+
+async function handlePinLogin(request, env) {
+  const { user_id, pin } = await request.json();
+
+  if (!user_id || !pin) {
+    return jsonResponse({ error: "Select your name and enter your PIN." }, 400);
+  }
+
+  // PIN login only works from a device that's already earned full trust.
+  const cookies = parseCookies(request.headers.get("Cookie"));
+  const trustedDevice = cookies.device
+    ? await env.DB.prepare("SELECT id FROM trusted_devices WHERE device_token = ? AND is_active = 1")
+        .bind(cookies.device)
+        .first()
+    : null;
+
+  if (!trustedDevice) {
+    return jsonResponse({ error: "This device isn't trusted. Log in with your password first." }, 403);
+  }
+
+  const user = await env.DB.prepare(
+    "SELECT id, pin_hash, pin_failed_attempts, pin_locked_until, is_active FROM users WHERE id = ?"
+  )
+    .bind(user_id)
+    .first();
+
+  if (!user || !user.is_active || !user.pin_hash) {
+    return jsonResponse({ error: "PIN login isn't available for this account." }, 400);
+  }
+
+  const now = new Date();
+
+  if (user.pin_locked_until && new Date(user.pin_locked_until) > now) {
+    return jsonResponse(
+      { error: "Too many wrong attempts. Log in with your password instead." },
+      423
+    );
+  }
+
+  const validPin = await verifyPassword(pin, user.pin_hash);
+
+  if (!validPin) {
+    const attempts = user.pin_failed_attempts + 1;
+
+    if (attempts >= MAX_PIN_ATTEMPTS) {
+      const lockedUntil = new Date(now.getTime() + PIN_LOCKOUT_MS).toISOString();
+      await env.DB.prepare("UPDATE users SET pin_failed_attempts = ?, pin_locked_until = ? WHERE id = ?")
+        .bind(attempts, lockedUntil, user.id)
+        .run();
+      await env.DB.prepare(
+        "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'pin_locked', 'user', ?)"
+      )
+        .bind(user.id, user.id)
+        .run();
+      return jsonResponse(
+        { error: "Too many wrong attempts. This PIN is now locked -- log in with your password instead." },
+        423
+      );
+    }
+
+    await env.DB.prepare("UPDATE users SET pin_failed_attempts = ? WHERE id = ?")
+      .bind(attempts, user.id)
+      .run();
+    return jsonResponse({ error: "Incorrect PIN." }, 400);
+  }
+
+  // Correct PIN -- clear any lockout state and log in.
+  const nowIso = now.toISOString();
+  await env.DB.prepare(
+    "UPDATE users SET pin_failed_attempts = 0, pin_locked_until = NULL, last_login_at = ? WHERE id = ?"
+  )
+    .bind(nowIso, user.id)
+    .run();
+
+  await env.DB.prepare("UPDATE trusted_devices SET last_used_at = ? WHERE id = ?")
+    .bind(nowIso, trustedDevice.id)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'pin_login', 'user', ?)"
+  )
+    .bind(user.id, user.id)
+    .run();
+
+  const sessionToken = await createSessionToken(user.id, env.SESSION_SECRET);
+  const headers = new Headers({ "content-type": "application/json" });
+  headers.append(
+    "Set-Cookie",
+    `session=${sessionToken}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=43200`
+  );
+  return new Response(JSON.stringify({ success: true }), { headers });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -382,7 +529,9 @@ const HTML_PAGE = `<!DOCTYPE html>
   .success { color: #27ae60; margin-top: 12px; font-size: 14px; }
   .toggle { margin-top: 16px; font-size: 13px; color: #666; text-align: center; }
   .toggle a { color: #1a1a1a; cursor: pointer; text-decoration: underline; }
-  #loginSection, #otpSection, #pinSetupSection { display: none; }
+  #setupSection, #loginSection, #otpSection, #pinSetupSection, #pinLoginSection { display: none; }
+  .staffBtn { text-align: left; background: white; color: #1a1a1a; border: 1px solid #ccc; margin-top: 8px; }
+  #pinPadSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 1px solid #eee; }
 </style>
 </head>
 <body>
@@ -431,11 +580,27 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div id="pinSetupMsg"></div>
   </div>
 
+  <div id="pinLoginSection">
+    <h1>Who's this?</h1>
+    <p class="sub">Tap your name to log in.</p>
+    <div id="staffList"></div>
+    <div id="pinPadSection">
+      <p class="sub" id="selectedStaffName"></p>
+      <label for="pinInput">PIN</label>
+      <input id="pinInput" type="password" maxlength="6" inputmode="numeric" />
+      <button id="pinLoginBtn">Log in</button>
+      <div id="pinLoginMsg"></div>
+      <p class="toggle"><a id="backToStaffList">Not you? Choose again</a></p>
+    </div>
+    <p class="toggle"><a id="usePasswordInstead">Use password instead</a></p>
+  </div>
+
 <script>
 let pendingEmail = "";
+let selectedStaffId = null;
 
 function showOnly(id) {
-  ["setupSection", "loginSection", "otpSection", "pinSetupSection"].forEach((sectionId) => {
+  ["setupSection", "loginSection", "otpSection", "pinSetupSection", "pinLoginSection"].forEach((sectionId) => {
     document.getElementById(sectionId).style.display = sectionId === id ? "block" : "none";
   });
 }
@@ -537,6 +702,73 @@ document.getElementById("setPinBtn").addEventListener("click", async () => {
   msg.textContent = "PIN saved! Next time this device offers a fast PIN login.";
   msg.className = "success";
 });
+
+async function checkDeviceStatus() {
+  const res = await fetch("/api/device-status");
+  const data = await res.json();
+
+  if (data.trusted) {
+    await loadStaffList();
+    showOnly("pinLoginSection");
+  } else if (data.owner_exists) {
+    showOnly("loginSection");
+  } else {
+    showOnly("setupSection");
+  }
+}
+
+async function loadStaffList() {
+  const res = await fetch("/api/staff-list");
+  const data = await res.json();
+  const container = document.getElementById("staffList");
+  container.innerHTML = "";
+
+  (data.staff || []).forEach((person) => {
+    const btn = document.createElement("button");
+    btn.className = "staffBtn";
+    btn.textContent = person.name;
+    btn.addEventListener("click", () => {
+      selectedStaffId = person.id;
+      document.getElementById("selectedStaffName").textContent = "Logging in as " + person.name;
+      document.getElementById("pinPadSection").style.display = "block";
+      const pinInput = document.getElementById("pinInput");
+      pinInput.value = "";
+      document.getElementById("pinLoginMsg").textContent = "";
+      pinInput.focus();
+    });
+    container.appendChild(btn);
+  });
+}
+
+document.getElementById("pinLoginBtn").addEventListener("click", async () => {
+  const pin = document.getElementById("pinInput").value.trim();
+  const msg = document.getElementById("pinLoginMsg");
+  msg.textContent = "";
+
+  const res = await fetch("/api/pin-login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ user_id: selectedStaffId, pin }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Logged in!";
+  msg.className = "success";
+});
+
+document.getElementById("backToStaffList").addEventListener("click", () => {
+  document.getElementById("pinPadSection").style.display = "none";
+});
+
+document.getElementById("usePasswordInstead").addEventListener("click", () => showOnly("loginSection"));
+
+checkDeviceStatus();
 </script>
 </body>
 </html>`;
