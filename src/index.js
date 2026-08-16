@@ -122,6 +122,10 @@ export default {
         return handleCreateProduct(request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/sales") {
+        return handleCreateSale(request, env);
+      }
+
       return new Response("Not found", { status: 404 });
     } catch (err) {
       // Catches anything unexpected so the browser always gets readable JSON
@@ -536,7 +540,7 @@ async function handleListProducts(request, env) {
   // No role restriction here -- cashiers need to see products to sell
   // them at checkout, same as everyone else.
   const { results } = await env.DB.prepare(
-    `SELECT id, sku, name, item_type, unit_price, unit_of_measure, stock_quantity, reorder_level
+    `SELECT id, sku, name, item_type, unit_price, unit_of_measure, stock_quantity, reorder_level, sst_applicable, sst_rate
      FROM products WHERE is_active = 1 ORDER BY name`
   ).all();
 
@@ -554,7 +558,7 @@ async function handleCreateProduct(request, env) {
   }
 
   const body = await request.json();
-  const { name, item_type, unit_price, sku, stock_quantity } = body;
+  const { name, item_type, unit_price, sku, stock_quantity, sst_applicable, sst_rate } = body;
 
   if (!name || !item_type || unit_price === undefined || unit_price === null || unit_price === "") {
     return jsonResponse({ error: "Name, type, and price are required." }, 400);
@@ -577,12 +581,14 @@ async function handleCreateProduct(request, env) {
 
   // Stock tracking only applies to physical goods -- services stay NULL.
   const stockValue = item_type === "goods" ? Number(stock_quantity) || 0 : null;
+  const sstApplicable = sst_applicable ? 1 : 0;
+  const sstRateValue = sstApplicable ? Number(sst_rate) || 0 : null;
 
   const result = await env.DB.prepare(
-    `INSERT INTO products (sku, name, item_type, unit_price, stock_quantity)
-     VALUES (?, ?, ?, ?, ?)`
+    `INSERT INTO products (sku, name, item_type, unit_price, stock_quantity, sst_applicable, sst_rate)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
   )
-    .bind(sku || null, name, item_type, priceSen, stockValue)
+    .bind(sku || null, name, item_type, priceSen, stockValue, sstApplicable, sstRateValue)
     .run();
 
   await env.DB.prepare(
@@ -592,6 +598,126 @@ async function handleCreateProduct(request, env) {
     .run();
 
   return jsonResponse({ success: true, id: result.meta.last_row_id });
+}
+
+async function handleCreateSale(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+
+  const body = await request.json();
+  const { items, payment_method, customer_id } = body;
+
+  if (!Array.isArray(items) || items.length === 0) {
+    return jsonResponse({ error: "Cart is empty." }, 400);
+  }
+  if (!["cash", "duitnow_qr", "card", "other"].includes(payment_method)) {
+    return jsonResponse({ error: "Select a valid payment method." }, 400);
+  }
+
+  // Load and validate every product BEFORE writing anything, so a bad item
+  // partway through the cart doesn't leave a half-completed sale behind.
+  const lineItems = [];
+  let subtotal = 0;
+  let sstAmount = 0;
+
+  for (const item of items) {
+    const qty = Number(item.quantity);
+    if (!item.product_id || !qty || qty <= 0) {
+      return jsonResponse({ error: "Invalid item in cart." }, 400);
+    }
+
+    const product = await env.DB.prepare(
+      `SELECT id, name, item_type, unit_price, cost_price, sst_applicable, sst_rate, stock_quantity, is_active
+       FROM products WHERE id = ?`
+    )
+      .bind(item.product_id)
+      .first();
+
+    if (!product || !product.is_active) {
+      return jsonResponse({ error: "A product in your cart is no longer available." }, 400);
+    }
+
+    if (product.item_type === "goods" && (product.stock_quantity === null || product.stock_quantity < qty)) {
+      return jsonResponse({ error: `Not enough stock for ${product.name}.` }, 400);
+    }
+
+    const lineSubtotal = product.unit_price * qty;
+    const lineSst = product.sst_applicable ? Math.round(lineSubtotal * (product.sst_rate || 0)) : 0;
+
+    subtotal += lineSubtotal;
+    sstAmount += lineSst;
+
+    lineItems.push({
+      product_id: product.id,
+      name: product.name,
+      quantity: qty,
+      unit_price: product.unit_price,
+      cost_price: product.cost_price,
+      sst_rate: product.sst_applicable ? product.sst_rate : null,
+      line_total: lineSubtotal + lineSst,
+      is_goods: product.item_type === "goods",
+    });
+  }
+
+  const totalAmount = subtotal + sstAmount;
+
+  // Sequential, human-readable receipt number -- e.g. INV-000001.
+  const countRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sales").first();
+  const receiptNumber = "INV-" + String(countRow.count + 1).padStart(6, "0");
+  const now = new Date().toISOString();
+
+  // No live payment gateway wired up yet, so every method is recorded as
+  // completed immediately -- swapping in real DuitNow QR/card confirmation
+  // later just changes this one line, not the rest of the checkout flow.
+  const saleResult = await env.DB.prepare(
+    `INSERT INTO sales (receipt_number, cashier_id, customer_id, subtotal, sst_amount, discount_amount, total_amount, payment_method, payment_status, einvoice_status, created_at)
+     VALUES (?, ?, ?, ?, ?, 0, ?, ?, 'completed', 'not_required', ?)`
+  )
+    .bind(receiptNumber, currentUser.id, customer_id || null, subtotal, sstAmount, totalAmount, payment_method, now)
+    .run();
+
+  const saleId = saleResult.meta.last_row_id;
+
+  for (const li of lineItems) {
+    await env.DB.prepare(
+      `INSERT INTO sale_items (sale_id, product_id, product_name_snapshot, quantity, unit_price_snapshot, sst_rate_snapshot, cost_price_snapshot, line_total)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(saleId, li.product_id, li.name, li.quantity, li.unit_price, li.sst_rate, li.cost_price, li.line_total)
+      .run();
+
+    if (li.is_goods) {
+      await env.DB.prepare("UPDATE products SET stock_quantity = stock_quantity - ? WHERE id = ?")
+        .bind(li.quantity, li.product_id)
+        .run();
+    }
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'sale_created', 'sale', ?)"
+  )
+    .bind(currentUser.id, saleId)
+    .run();
+
+  return jsonResponse({
+    success: true,
+    sale: {
+      id: saleId,
+      receipt_number: receiptNumber,
+      subtotal: senToRinggit(subtotal),
+      sst_amount: senToRinggit(sstAmount),
+      total_amount: senToRinggit(totalAmount),
+      payment_method,
+      items: lineItems.map((li) => ({
+        name: li.name,
+        quantity: li.quantity,
+        unit_price: senToRinggit(li.unit_price),
+        line_total: senToRinggit(li.line_total),
+      })),
+    },
+  });
 }
 
 const HTML_PAGE = `<!DOCTYPE html>
@@ -621,6 +747,11 @@ const HTML_PAGE = `<!DOCTYPE html>
   .productRow span:first-child { flex: 1; }
   .productRow span { color: #444; }
   select { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; box-sizing: border-box; }
+  input[type="checkbox"] { width: auto; }
+  .inlineLabel { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 14px; font-weight: 600; }
+  .smallBtn { width: auto; margin: 0 0 0 12px; padding: 4px 12px; font-size: 13px; }
+  #receiptSection { display: none; margin-top: 24px; padding-top: 24px; border-top: 2px solid #1a1a1a; }
+  .totalRow { font-weight: 600; }
 </style>
 </head>
 <body>
@@ -691,6 +822,26 @@ const HTML_PAGE = `<!DOCTYPE html>
     <h2 class="sectionTitle">Products</h2>
     <div id="productList"></div>
 
+    <h2 class="sectionTitle">New Sale</h2>
+    <div id="cartItems"></div>
+    <div id="cartTotals"></div>
+    <label for="paymentMethod">Payment method</label>
+    <select id="paymentMethod">
+      <option value="cash">Cash</option>
+      <option value="duitnow_qr">DuitNow QR</option>
+      <option value="card">Card</option>
+    </select>
+    <button id="checkoutBtn">Complete sale</button>
+    <div id="checkoutMsg"></div>
+
+    <div id="receiptSection">
+      <h2 class="sectionTitle">Sale complete</h2>
+      <p class="sub">Receipt <span id="receiptNumber"></span></p>
+      <div id="receiptItems"></div>
+      <div class="productRow totalRow"><span>Total</span><span id="receiptTotal"></span></div>
+      <button id="newSaleBtn">New sale</button>
+    </div>
+
     <div id="addProductSection">
       <h2 class="sectionTitle">Add a product</h2>
       <label for="prodName">Name</label>
@@ -708,6 +859,11 @@ const HTML_PAGE = `<!DOCTYPE html>
         <label for="prodStock">Stock quantity</label>
         <input id="prodStock" type="number" min="0" />
       </div>
+      <label class="inlineLabel"><input type="checkbox" id="prodSstApplicable" /> SST applicable</label>
+      <div id="sstRateField" style="display: none;">
+        <label for="prodSstRate">SST rate (%)</label>
+        <input id="prodSstRate" type="number" step="0.01" min="0" max="100" placeholder="e.g. 6" />
+      </div>
       <button id="addProductBtn">Add product</button>
       <div id="addProductMsg"></div>
     </div>
@@ -717,6 +873,7 @@ const HTML_PAGE = `<!DOCTYPE html>
 let pendingEmail = "";
 let selectedStaffId = null;
 let countdownInterval = null;
+let cart = [];
 
 // Ticks down a lockout countdown using the real server timestamp, so it
 // shows the correct remaining time even after a page refresh -- refreshing
@@ -962,6 +1119,8 @@ async function loadDashboard() {
   // Cashiers can see products at checkout later, but shouldn't see the
   // add-product form -- that's staff/admin/owner territory.
   document.getElementById("addProductSection").style.display = me.role === "cashier" ? "none" : "block";
+  cart = [];
+  renderCart();
   await loadProducts();
   showOnly("dashboardSection");
 }
@@ -983,6 +1142,11 @@ async function loadProducts() {
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
     row.innerHTML =
       "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
+    const addBtn = document.createElement("button");
+    addBtn.textContent = "Add";
+    addBtn.className = "smallBtn";
+    addBtn.addEventListener("click", () => addToCart(p));
+    row.appendChild(addBtn);
     container.appendChild(row);
   });
 }
@@ -991,12 +1155,18 @@ document.getElementById("prodType").addEventListener("change", (e) => {
   document.getElementById("stockFields").style.display = e.target.value === "goods" ? "block" : "none";
 });
 
+document.getElementById("prodSstApplicable").addEventListener("change", (e) => {
+  document.getElementById("sstRateField").style.display = e.target.checked ? "block" : "none";
+});
+
 document.getElementById("addProductBtn").addEventListener("click", async () => {
   const name = document.getElementById("prodName").value.trim();
   const item_type = document.getElementById("prodType").value;
   const unit_price = document.getElementById("prodPrice").value;
   const sku = document.getElementById("prodSku").value.trim();
   const stock_quantity = document.getElementById("prodStock").value;
+  const sstApplicable = document.getElementById("prodSstApplicable").checked;
+  const sstRatePercent = document.getElementById("prodSstRate").value;
   const msg = document.getElementById("addProductMsg");
   msg.textContent = "";
 
@@ -1009,6 +1179,8 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
       unit_price,
       sku: sku || undefined,
       stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
+      sst_applicable: sstApplicable,
+      sst_rate: sstApplicable ? Number(sstRatePercent || 0) / 100 : undefined,
     }),
   });
   const data = await res.json();
@@ -1025,7 +1197,132 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
   document.getElementById("prodPrice").value = "";
   document.getElementById("prodSku").value = "";
   document.getElementById("prodStock").value = "";
+  document.getElementById("prodSstApplicable").checked = false;
+  document.getElementById("prodSstRate").value = "";
+  document.getElementById("sstRateField").style.display = "none";
   await loadProducts();
+});
+
+function addToCart(product) {
+  const existing = cart.find((c) => c.product_id === product.id);
+  if (existing) {
+    existing.quantity += 1;
+  } else {
+    cart.push({
+      product_id: product.id,
+      name: product.name,
+      unit_price: Number(product.unit_price_display),
+      sst_applicable: product.sst_applicable,
+      sst_rate: product.sst_rate,
+      quantity: 1,
+    });
+  }
+  renderCart();
+}
+
+function renderCart() {
+  const container = document.getElementById("cartItems");
+  container.innerHTML = "";
+
+  if (cart.length === 0) {
+    container.innerHTML = '<p class="sub">Tap "Add" on a product above to start a sale.</p>';
+    document.getElementById("cartTotals").innerHTML = "";
+    return;
+  }
+
+  let subtotal = 0;
+  let sstTotal = 0;
+
+  cart.forEach((item, index) => {
+    const lineSubtotal = item.unit_price * item.quantity;
+    const lineSst = item.sst_applicable ? lineSubtotal * (item.sst_rate || 0) : 0;
+    subtotal += lineSubtotal;
+    sstTotal += lineSst;
+
+    const row = document.createElement("div");
+    row.className = "productRow";
+    row.innerHTML =
+      "<span>" +
+      item.name +
+      " x" +
+      item.quantity +
+      "</span><span>RM " +
+      (lineSubtotal + lineSst).toFixed(2) +
+      "</span>";
+    const removeBtn = document.createElement("button");
+    removeBtn.textContent = "Remove";
+    removeBtn.className = "smallBtn";
+    removeBtn.addEventListener("click", () => {
+      cart.splice(index, 1);
+      renderCart();
+    });
+    row.appendChild(removeBtn);
+    container.appendChild(row);
+  });
+
+  const total = subtotal + sstTotal;
+  document.getElementById("cartTotals").innerHTML =
+    '<div class="productRow"><span>Subtotal</span><span>RM ' +
+    subtotal.toFixed(2) +
+    '</span></div>' +
+    '<div class="productRow"><span>SST</span><span>RM ' +
+    sstTotal.toFixed(2) +
+    '</span></div>' +
+    '<div class="productRow totalRow"><span>Total</span><span>RM ' +
+    total.toFixed(2) +
+    "</span></div>";
+}
+
+document.getElementById("checkoutBtn").addEventListener("click", async () => {
+  const msg = document.getElementById("checkoutMsg");
+  msg.textContent = "";
+
+  if (cart.length === 0) {
+    msg.textContent = "Cart is empty.";
+    msg.className = "error";
+    return;
+  }
+
+  const payment_method = document.getElementById("paymentMethod").value;
+
+  const res = await fetch("/api/sales", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      items: cart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
+      payment_method,
+    }),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  cart = [];
+  renderCart();
+  showReceipt(data.sale);
+  await loadProducts(); // stock counts just changed, refresh the list
+});
+
+function showReceipt(sale) {
+  const container = document.getElementById("receiptItems");
+  container.innerHTML = "";
+  sale.items.forEach((item) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    row.innerHTML = "<span>" + item.name + " x" + item.quantity + "</span><span>RM " + item.line_total + "</span>";
+    container.appendChild(row);
+  });
+  document.getElementById("receiptNumber").textContent = sale.receipt_number;
+  document.getElementById("receiptTotal").textContent = "RM " + sale.total_amount;
+  document.getElementById("receiptSection").style.display = "block";
+}
+
+document.getElementById("newSaleBtn").addEventListener("click", () => {
+  document.getElementById("receiptSection").style.display = "none";
 });
 
 checkDeviceStatus();
