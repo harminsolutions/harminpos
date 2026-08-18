@@ -221,13 +221,17 @@ export default {
 };
 
 async function handleSetup(request, env) {
-  const { name, email, password } = await request.json();
+  const { name, email, password, business_type } = await request.json();
 
   if (!name || !email || !password) {
     return jsonResponse({ error: "Name, email, and password are required." }, 400);
   }
   if (password.length < 8) {
     return jsonResponse({ error: "Password must be at least 8 characters." }, 400);
+  }
+  const validTypes = ["retail", "food_beverage", "service", "other"];
+  if (!business_type || !validTypes.includes(business_type)) {
+    return jsonResponse({ error: "Select a business type." }, 400);
   }
 
   // Only one owner account is allowed to be created this way -- this endpoint
@@ -255,6 +259,15 @@ async function handleSetup(request, env) {
     .run();
 
   const userId = result.meta.last_row_id;
+
+  // Business legal details (TIN, SSM number, etc.) get filled in later via
+  // Settings -- this just plants the row early so business_type is captured
+  // right at signup, with empty placeholders for the required fields.
+  await env.DB.prepare(
+    "INSERT INTO business_profile (id, legal_name, ssm_registration_no, tin, business_type) VALUES (1, '', '', '', ?)"
+  )
+    .bind(business_type)
+    .run();
 
   const otp = generateOTP();
   const otpHash = await hashOTP(otp);
@@ -422,12 +435,14 @@ async function handleMe(request, env) {
   if (!currentUser) {
     return jsonResponse({ error: "Not logged in." }, 401);
   }
+  const profile = await env.DB.prepare("SELECT business_type FROM business_profile WHERE id = 1").first();
   return jsonResponse({
     id: currentUser.id,
     name: currentUser.name,
     email: currentUser.email,
     role: currentUser.role,
     has_pin: !!currentUser.pin_hash,
+    business_type: profile ? profile.business_type : null,
   });
 }
 
@@ -1607,6 +1622,15 @@ const HTML_PAGE = `<!DOCTYPE html>
   .toggle { margin-top: 16px; font-size: 13px; color: var(--text-muted); text-align: center; }
   .toggle a { color: var(--ink); cursor: pointer; text-decoration: underline; }
   .inlineLabel { display: flex; align-items: center; gap: 8px; margin-top: 16px; font-size: 14px; font-weight: 600; }
+  .bizTypeGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+  .bizTypeBtn { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; text-align: left; background: white; color: var(--text); border: 2px solid var(--paper-edge); margin: 0; padding: 14px; font-weight: 400; }
+  .bizTypeBtn:hover { background: var(--paper); }
+  .bizTypeBtn.selected { border-color: var(--brass); background: #FBF3E7; }
+  .bizTypeName { font-weight: 600; font-size: 14px; color: var(--text); }
+  .bizTypeDesc { font-size: 12px; color: var(--text-muted); }
+  @media (max-width: 480px) {
+    .bizTypeGrid { grid-template-columns: 1fr; }
+  }
   .smallBtn { width: auto; margin: 0 0 0 12px; padding: 6px 14px; font-size: 13px; background: white; color: var(--ink); border: 1px solid var(--paper-edge); }
   .smallBtn:hover { background: var(--paper); }
   .staffBtn { text-align: left; background: white; color: var(--text); border: 1px solid var(--paper-edge); margin-top: 8px; font-weight: 500; }
@@ -1631,7 +1655,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .tabBtn { width: auto; background: none; color: var(--text-muted); border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 14px 4px; margin: 0 20px 0 0; font-weight: 600; font-size: 14px; white-space: nowrap; }
   .tabBtn:hover { background: none; color: var(--ink); }
   .tabBtn.active { color: var(--ink); border-bottom-color: var(--brass); }
-  #productsTab, #reportsTab, #staffTab, #settingsTab { display: none; }
+  #productsTab, #suppliersTab, #reportsTab, #staffTab, #settingsTab { display: none; }
   .padded-panel { max-width: 880px; margin: 0 auto; padding: 28px; }
 
   /* Checkout: two-column POS layout */
@@ -1680,6 +1704,26 @@ const HTML_PAGE = `<!DOCTYPE html>
     <input id="email" type="email" />
     <label for="password">Password</label>
     <input id="password" type="password" />
+    <label>What type of business is this?</label>
+    <div class="bizTypeGrid">
+      <button type="button" class="bizTypeBtn" data-type="retail">
+        <span class="bizTypeName">Retail</span>
+        <span class="bizTypeDesc">Shop selling physical products</span>
+      </button>
+      <button type="button" class="bizTypeBtn" data-type="food_beverage">
+        <span class="bizTypeName">Food &amp; Beverage</span>
+        <span class="bizTypeDesc">Cafe, restaurant, food stall</span>
+      </button>
+      <button type="button" class="bizTypeBtn" data-type="service">
+        <span class="bizTypeName">Service</span>
+        <span class="bizTypeDesc">Tuition, salon, clinic, and similar</span>
+      </button>
+      <button type="button" class="bizTypeBtn" data-type="other">
+        <span class="bizTypeName">Other</span>
+        <span class="bizTypeDesc">Doesn't fit the above</span>
+      </button>
+    </div>
+    <input type="hidden" id="setupBusinessType" value="" />
     <button id="setupBtn">Create account</button>
     <div id="setupMsg"></div>
     <p class="toggle">Already set up? <a id="showLogin">Log in instead</a></p>
@@ -1740,6 +1784,7 @@ const HTML_PAGE = `<!DOCTYPE html>
     <div class="tabBar">
       <button id="tabCheckoutBtn" class="tabBtn">Checkout</button>
       <button id="tabProductsBtn" class="tabBtn">Products</button>
+      <button id="tabSuppliersBtn" class="tabBtn">Suppliers</button>
       <button id="tabReportsBtn" class="tabBtn">Reports</button>
       <button id="tabStaffBtn" class="tabBtn">Staff</button>
       <button id="tabSettingsBtn" class="tabBtn">Settings</button>
@@ -1800,17 +1845,6 @@ const HTML_PAGE = `<!DOCTYPE html>
       <h2 class="sectionTitle">All products</h2>
       <div id="manageProductList"></div>
 
-      <h2 class="sectionTitle">Suppliers</h2>
-      <div id="supplierList"></div>
-      <label for="newSupplierName">Supplier name</label>
-      <input id="newSupplierName" type="text" />
-      <label for="newSupplierContact">Contact person (optional)</label>
-      <input id="newSupplierContact" type="text" />
-      <label for="newSupplierPhone">Phone (optional)</label>
-      <input id="newSupplierPhone" type="text" />
-      <button id="addSupplierBtn">Add supplier</button>
-      <div id="addSupplierMsg"></div>
-
       <div id="addProductSection">
         <h2 class="sectionTitle" id="productFormTitle">Add a product</h2>
         <p class="toggle" id="cancelEditRow" style="display: none; text-align: left; margin-top: 0;">
@@ -1845,6 +1879,21 @@ const HTML_PAGE = `<!DOCTYPE html>
         <button id="addProductBtn">Add product</button>
         <div id="addProductMsg"></div>
       </div>
+    </div>
+
+    <div id="suppliersTab" class="padded-panel">
+      <h2 class="sectionTitle" style="margin-top: 0;">Suppliers</h2>
+      <div id="supplierList"></div>
+
+      <h2 class="sectionTitle">Add a supplier</h2>
+      <label for="newSupplierName">Supplier name</label>
+      <input id="newSupplierName" type="text" />
+      <label for="newSupplierContact">Contact person (optional)</label>
+      <input id="newSupplierContact" type="text" />
+      <label for="newSupplierPhone">Phone (optional)</label>
+      <input id="newSupplierPhone" type="text" />
+      <button id="addSupplierBtn">Add supplier</button>
+      <div id="addSupplierMsg"></div>
     </div>
 
     <div id="reportsTab" class="padded-panel">
@@ -1931,14 +1980,17 @@ let allProducts = [];
 function showTab(tab) {
   document.getElementById("checkoutTab").style.display = tab === "checkout" ? "grid" : "none";
   document.getElementById("productsTab").style.display = tab === "products" ? "block" : "none";
+  document.getElementById("suppliersTab").style.display = tab === "suppliers" ? "block" : "none";
   document.getElementById("reportsTab").style.display = tab === "reports" ? "block" : "none";
   document.getElementById("staffTab").style.display = tab === "staff" ? "block" : "none";
   document.getElementById("settingsTab").style.display = tab === "settings" ? "block" : "none";
   document.getElementById("tabCheckoutBtn").className = "tabBtn" + (tab === "checkout" ? " active" : "");
   document.getElementById("tabProductsBtn").className = "tabBtn" + (tab === "products" ? " active" : "");
+  document.getElementById("tabSuppliersBtn").className = "tabBtn" + (tab === "suppliers" ? " active" : "");
   document.getElementById("tabReportsBtn").className = "tabBtn" + (tab === "reports" ? " active" : "");
   document.getElementById("tabStaffBtn").className = "tabBtn" + (tab === "staff" ? " active" : "");
   document.getElementById("tabSettingsBtn").className = "tabBtn" + (tab === "settings" ? " active" : "");
+  if (tab === "suppliers") loadSuppliers();
   if (tab === "reports") {
     loadReports();
     loadSalesHistory();
@@ -1953,6 +2005,7 @@ function showTab(tab) {
 
 document.getElementById("tabCheckoutBtn").addEventListener("click", () => showTab("checkout"));
 document.getElementById("tabProductsBtn").addEventListener("click", () => showTab("products"));
+document.getElementById("tabSuppliersBtn").addEventListener("click", () => showTab("suppliers"));
 document.getElementById("tabReportsBtn").addEventListener("click", () => showTab("reports"));
 document.getElementById("tabStaffBtn").addEventListener("click", () => showTab("staff"));
 document.getElementById("tabSettingsBtn").addEventListener("click", () => showTab("settings"));
@@ -2004,17 +2057,32 @@ function showOnly(id) {
 
 document.getElementById("showLogin").addEventListener("click", () => showOnly("loginSection"));
 
+document.querySelectorAll(".bizTypeBtn").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".bizTypeBtn").forEach((b) => b.classList.remove("selected"));
+    btn.classList.add("selected");
+    document.getElementById("setupBusinessType").value = btn.dataset.type;
+  });
+});
+
 document.getElementById("setupBtn").addEventListener("click", async () => {
   const name = document.getElementById("name").value.trim();
   const email = document.getElementById("email").value.trim();
   const password = document.getElementById("password").value;
+  const business_type = document.getElementById("setupBusinessType").value;
   const msg = document.getElementById("setupMsg");
   msg.textContent = "";
+
+  if (!business_type) {
+    msg.textContent = "Choose a business type above.";
+    msg.className = "error";
+    return;
+  }
 
   const res = await fetch("/api/setup", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ name, email, password }),
+    body: JSON.stringify({ name, email, password, business_type }),
   });
   const data = await res.json();
 
@@ -2203,8 +2271,16 @@ async function loadDashboard() {
   const me = await fetch("/api/me").then((r) => r.json());
   currentUserRole = me.role;
   document.getElementById("welcomeMsg").textContent = "Logged in as " + me.name + " (" + me.role + ")";
+  // If this business was set up as a service business, default new items
+  // to "service" instead of "goods" -- reduces the exact kind of mistake
+  // where a service gets added with a stock count by accident.
+  if (me.business_type === "service") {
+    document.getElementById("prodType").value = "service";
+    document.getElementById("stockFields").style.display = "none";
+  }
   // Cashiers live on the Checkout tab -- everything else is management territory.
   document.getElementById("tabProductsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
+  document.getElementById("tabSuppliersBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
   document.getElementById("tabReportsBtn").style.display = me.role === "cashier" ? "none" : "inline-block";
   document.getElementById("tabStaffBtn").style.display = ["owner", "admin"].includes(me.role)
     ? "inline-block"
