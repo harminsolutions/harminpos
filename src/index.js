@@ -142,6 +142,38 @@ export default {
         return handleCreateUser(request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/users/deactivate") {
+        return handleDeactivateUser(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/sales") {
+        return handleListSales(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/sales/void") {
+        return handleVoidSale(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/business-profile") {
+        return handleGetBusinessProfile(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/business-profile") {
+        return handleSetBusinessProfile(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/audit-log") {
+        return handleListAuditLog(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/devices") {
+        return handleListDevices(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/devices/revoke") {
+        return handleRevokeDevice(request, env);
+      }
+
       if (request.method === "POST" && url.pathname === "/api/sales") {
         return handleCreateSale(request, env);
       }
@@ -1071,6 +1103,277 @@ async function handleCreateUser(request, env) {
   return jsonResponse({ success: true, id: result.meta.last_row_id });
 }
 
+async function handleDeactivateUser(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage staff." }, 403);
+  }
+
+  const { user_id } = await request.json();
+  if (!user_id) {
+    return jsonResponse({ error: "Missing account." }, 400);
+  }
+  if (Number(user_id) === currentUser.id) {
+    return jsonResponse({ error: "You can't deactivate your own account." }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, role FROM users WHERE id = ?").bind(user_id).first();
+  if (!target) {
+    return jsonResponse({ error: "Account not found." }, 404);
+  }
+  if (target.role === "owner") {
+    return jsonResponse({ error: "The owner account can't be deactivated." }, 400);
+  }
+  if (target.role === "admin" && currentUser.role !== "owner") {
+    return jsonResponse({ error: "Only the owner can deactivate an admin." }, 403);
+  }
+
+  await env.DB.prepare("UPDATE users SET is_active = 0 WHERE id = ?").bind(user_id).run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'user_deactivated', 'user', ?)"
+  )
+    .bind(currentUser.id, user_id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleListSales(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view sales." }, 403);
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT s.id, s.receipt_number, s.total_amount, s.payment_method, s.is_voided, s.created_at, u.name as cashier_name
+     FROM sales s JOIN users u ON u.id = s.cashier_id
+     ORDER BY s.created_at DESC LIMIT 50`
+  ).all();
+
+  const sales = results.map((s) => ({ ...s, total_display: senToRinggit(s.total_amount) }));
+  return jsonResponse({ sales });
+}
+
+async function handleVoidSale(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "Only an owner or admin can void a sale." }, 403);
+  }
+
+  const { sale_id, reason } = await request.json();
+  if (!sale_id) {
+    return jsonResponse({ error: "Missing sale." }, 400);
+  }
+
+  const sale = await env.DB.prepare("SELECT id, is_voided FROM sales WHERE id = ?").bind(sale_id).first();
+  if (!sale) {
+    return jsonResponse({ error: "Sale not found." }, 404);
+  }
+  if (sale.is_voided) {
+    return jsonResponse({ error: "This sale is already voided." }, 400);
+  }
+
+  // Reverse the stock deduction for any physical goods in this sale --
+  // voiding a sale means it never really happened, so the stock shouldn't
+  // stay down either.
+  const { results: items } = await env.DB.prepare("SELECT product_id, quantity FROM sale_items WHERE sale_id = ?")
+    .bind(sale_id)
+    .all();
+
+  for (const item of items) {
+    if (!item.product_id) continue;
+    await env.DB.prepare("UPDATE products SET stock_quantity = stock_quantity + ? WHERE id = ? AND item_type = 'goods'")
+      .bind(item.quantity, item.product_id)
+      .run();
+  }
+
+  await env.DB.prepare("UPDATE sales SET is_voided = 1, voided_by = ?, voided_reason = ? WHERE id = ?")
+    .bind(currentUser.id, reason || null, sale_id)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id, details) VALUES (?, 'sale_voided', 'sale', ?, ?)"
+  )
+    .bind(currentUser.id, sale_id, reason || null)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleGetBusinessProfile(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view business details." }, 403);
+  }
+
+  const profile = await env.DB.prepare("SELECT * FROM business_profile WHERE id = 1").first();
+  return jsonResponse({ profile: profile || null });
+}
+
+async function handleSetBusinessProfile(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  // Editing legal/tax details is owner-only -- these feed e-Invoice
+  // submissions directly, so a mistake here is a compliance problem,
+  // not just a typo.
+  if (currentUser.role !== "owner") {
+    return jsonResponse({ error: "Only the owner can edit business details." }, 403);
+  }
+
+  const body = await request.json();
+  const {
+    legal_name,
+    trading_name,
+    ssm_registration_no,
+    tin,
+    sst_registration_no,
+    msic_code,
+    address_line1,
+    address_line2,
+    city,
+    state,
+    postcode,
+    phone,
+    email,
+  } = body;
+
+  if (!legal_name || !ssm_registration_no || !tin) {
+    return jsonResponse({ error: "Legal name, SSM registration number, and TIN are required." }, 400);
+  }
+
+  const now = new Date().toISOString();
+  const existing = await env.DB.prepare("SELECT id FROM business_profile WHERE id = 1").first();
+
+  if (existing) {
+    await env.DB.prepare(
+      `UPDATE business_profile SET legal_name=?, trading_name=?, ssm_registration_no=?, tin=?, sst_registration_no=?, msic_code=?,
+       address_line1=?, address_line2=?, city=?, state=?, postcode=?, phone=?, email=?, updated_at=? WHERE id = 1`
+    )
+      .bind(
+        legal_name,
+        trading_name || null,
+        ssm_registration_no,
+        tin,
+        sst_registration_no || null,
+        msic_code || null,
+        address_line1 || null,
+        address_line2 || null,
+        city || null,
+        state || null,
+        postcode || null,
+        phone || null,
+        email || null,
+        now
+      )
+      .run();
+  } else {
+    await env.DB.prepare(
+      `INSERT INTO business_profile (id, legal_name, trading_name, ssm_registration_no, tin, sst_registration_no, msic_code, address_line1, address_line2, city, state, postcode, phone, email)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    )
+      .bind(
+        legal_name,
+        trading_name || null,
+        ssm_registration_no,
+        tin,
+        sst_registration_no || null,
+        msic_code || null,
+        address_line1 || null,
+        address_line2 || null,
+        city || null,
+        state || null,
+        postcode || null,
+        phone || null,
+        email || null
+      )
+      .run();
+  }
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'business_profile_updated', 'business_profile', 1)"
+  )
+    .bind(currentUser.id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleListAuditLog(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view the audit log." }, 403);
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT a.id, a.action, a.entity_type, a.entity_id, a.created_at, u.name as user_name
+     FROM audit_log a LEFT JOIN users u ON u.id = a.user_id
+     ORDER BY a.created_at DESC LIMIT 100`
+  ).all();
+
+  return jsonResponse({ logs: results });
+}
+
+async function handleListDevices(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view devices." }, 403);
+  }
+
+  const { results } = await env.DB.prepare(
+    `SELECT d.id, d.device_name, d.trusted_at, d.last_used_at, d.is_active, u.name as verified_by_name
+     FROM trusted_devices d JOIN users u ON u.id = d.verified_by
+     ORDER BY d.trusted_at DESC`
+  ).all();
+
+  return jsonResponse({ devices: results });
+}
+
+async function handleRevokeDevice(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage devices." }, 403);
+  }
+
+  const { device_id } = await request.json();
+  if (!device_id) {
+    return jsonResponse({ error: "Missing device." }, 400);
+  }
+
+  await env.DB.prepare("UPDATE trusted_devices SET is_active = 0 WHERE id = ?").bind(device_id).run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'device_revoked', 'trusted_device', ?)"
+  )
+    .bind(currentUser.id, device_id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
 const HTML_PAGE = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1134,7 +1437,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .tabBtn { width: auto; background: none; color: var(--text-muted); border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 14px 4px; margin: 0 20px 0 0; font-weight: 600; font-size: 14px; white-space: nowrap; }
   .tabBtn:hover { background: none; color: var(--ink); }
   .tabBtn.active { color: var(--ink); border-bottom-color: var(--brass); }
-  #productsTab, #reportsTab, #staffTab { display: none; }
+  #productsTab, #reportsTab, #staffTab, #settingsTab { display: none; }
   .padded-panel { max-width: 880px; margin: 0 auto; padding: 28px; }
 
   /* Checkout: two-column POS layout */
@@ -1245,6 +1548,7 @@ const HTML_PAGE = `<!DOCTYPE html>
       <button id="tabProductsBtn" class="tabBtn">Products</button>
       <button id="tabReportsBtn" class="tabBtn">Reports</button>
       <button id="tabStaffBtn" class="tabBtn">Staff</button>
+      <button id="tabSettingsBtn" class="tabBtn">Settings</button>
     </div>
 
     <div id="checkoutTab" class="pos-layout">
@@ -1345,10 +1649,13 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
 
     <div id="reportsTab" class="padded-panel">
-      <h2 class="sectionTitle">Today</h2>
+      <h2 class="sectionTitle" style="margin-top: 0;">Today</h2>
       <div class="productRow"><span>Sales</span><span id="reportSaleCount"></span></div>
       <div class="productRow"><span>Revenue</span><span id="reportRevenue"></span></div>
       <div class="productRow totalRow"><span>Profit</span><span id="reportProfit"></span></div>
+
+      <h2 class="sectionTitle">Recent sales</h2>
+      <div id="salesHistoryList"></div>
     </div>
 
     <div id="staffTab" class="padded-panel">
@@ -1367,6 +1674,44 @@ const HTML_PAGE = `<!DOCTYPE html>
       <button id="addStaffBtn">Add team member</button>
       <div id="addStaffMsg"></div>
     </div>
+
+    <div id="settingsTab" class="padded-panel">
+      <h2 class="sectionTitle" style="margin-top: 0;">Business details</h2>
+      <p class="sub">Used on receipts and required for LHDN e-Invoice submissions.</p>
+      <label for="bizLegalName">Legal business name</label>
+      <input id="bizLegalName" type="text" />
+      <label for="bizTradingName">Trading name (optional)</label>
+      <input id="bizTradingName" type="text" />
+      <label for="bizSsm">SSM registration number</label>
+      <input id="bizSsm" type="text" />
+      <label for="bizTin">TIN (LHDN Tax ID)</label>
+      <input id="bizTin" type="text" />
+      <label for="bizSst">SST registration number (optional)</label>
+      <input id="bizSst" type="text" />
+      <label for="bizMsic">MSIC code (optional)</label>
+      <input id="bizMsic" type="text" />
+      <label for="bizPhone">Phone</label>
+      <input id="bizPhone" type="text" />
+      <label for="bizEmail">Email</label>
+      <input id="bizEmail" type="email" />
+      <label for="bizAddress1">Address line 1</label>
+      <input id="bizAddress1" type="text" />
+      <label for="bizCity">City</label>
+      <input id="bizCity" type="text" />
+      <label for="bizState">State</label>
+      <input id="bizState" type="text" />
+      <label for="bizPostcode">Postcode</label>
+      <input id="bizPostcode" type="text" />
+      <button id="saveBusinessBtn">Save business details</button>
+      <div id="saveBusinessMsg"></div>
+
+      <h2 class="sectionTitle">Trusted devices</h2>
+      <div id="deviceList"></div>
+
+      <h2 class="sectionTitle">Audit log</h2>
+      <p class="sub">Every login, sale, void, and account change -- most recent first.</p>
+      <div id="auditLogList"></div>
+    </div>
   </div>
 
 <script>
@@ -1381,18 +1726,29 @@ function showTab(tab) {
   document.getElementById("productsTab").style.display = tab === "products" ? "block" : "none";
   document.getElementById("reportsTab").style.display = tab === "reports" ? "block" : "none";
   document.getElementById("staffTab").style.display = tab === "staff" ? "block" : "none";
+  document.getElementById("settingsTab").style.display = tab === "settings" ? "block" : "none";
   document.getElementById("tabCheckoutBtn").className = "tabBtn" + (tab === "checkout" ? " active" : "");
   document.getElementById("tabProductsBtn").className = "tabBtn" + (tab === "products" ? " active" : "");
   document.getElementById("tabReportsBtn").className = "tabBtn" + (tab === "reports" ? " active" : "");
   document.getElementById("tabStaffBtn").className = "tabBtn" + (tab === "staff" ? " active" : "");
-  if (tab === "reports") loadReports();
+  document.getElementById("tabSettingsBtn").className = "tabBtn" + (tab === "settings" ? " active" : "");
+  if (tab === "reports") {
+    loadReports();
+    loadSalesHistory();
+  }
   if (tab === "staff") loadStaffTab();
+  if (tab === "settings") {
+    loadBusinessSettings();
+    loadDevices();
+    loadAuditLog();
+  }
 }
 
 document.getElementById("tabCheckoutBtn").addEventListener("click", () => showTab("checkout"));
 document.getElementById("tabProductsBtn").addEventListener("click", () => showTab("products"));
 document.getElementById("tabReportsBtn").addEventListener("click", () => showTab("reports"));
 document.getElementById("tabStaffBtn").addEventListener("click", () => showTab("staff"));
+document.getElementById("tabSettingsBtn").addEventListener("click", () => showTab("settings"));
 
 // Ticks down a lockout countdown using the real server timestamp, so it
 // shows the correct remaining time even after a page refresh -- refreshing
@@ -1645,6 +2001,7 @@ async function loadDashboard() {
   document.getElementById("tabStaffBtn").style.display = ["owner", "admin"].includes(me.role)
     ? "inline-block"
     : "none";
+  document.getElementById("tabSettingsBtn").style.display = me.role === "owner" ? "inline-block" : "none";
   populateRoleDropdown();
   cart = [];
   renderCart();
@@ -2086,6 +2443,26 @@ async function loadStaffTab() {
     const row = document.createElement("div");
     row.className = "productRow";
     row.innerHTML = "<span>" + u.name + "</span><span>" + u.email + "</span><span>" + u.role + "</span>";
+    if (u.role !== "owner") {
+      const deactivateBtn = document.createElement("button");
+      deactivateBtn.textContent = "Deactivate";
+      deactivateBtn.className = "smallBtn";
+      deactivateBtn.addEventListener("click", async () => {
+        if (!confirm("Deactivate " + u.name + "? They'll lose access immediately.")) return;
+        const res2 = await fetch("/api/users/deactivate", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ user_id: u.id }),
+        });
+        if (res2.ok) {
+          await loadStaffTab();
+        } else {
+          const errData = await res2.json();
+          alert(errData.error);
+        }
+      });
+      row.appendChild(deactivateBtn);
+    }
     container.appendChild(row);
   });
 }
@@ -2118,6 +2495,170 @@ document.getElementById("addStaffBtn").addEventListener("click", async () => {
   document.getElementById("newStaffPassword").value = "";
   await loadStaffTab();
 });
+
+async function loadSalesHistory() {
+  const res = await fetch("/api/sales");
+  const data = await res.json();
+  const container = document.getElementById("salesHistoryList");
+  container.innerHTML = "";
+
+  if (!data.sales || data.sales.length === 0) {
+    container.innerHTML = '<p class="sub">No sales yet.</p>';
+    return;
+  }
+
+  data.sales.forEach((s) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const statusText = s.is_voided ? " (voided)" : "";
+    row.innerHTML =
+      "<span>" +
+      s.receipt_number +
+      statusText +
+      " -- " +
+      s.cashier_name +
+      "</span><span>RM " +
+      s.total_display +
+      "</span>";
+
+    if (!s.is_voided && ["owner", "admin"].includes(currentUserRole)) {
+      const voidBtn = document.createElement("button");
+      voidBtn.textContent = "Void";
+      voidBtn.className = "smallBtn";
+      voidBtn.addEventListener("click", async () => {
+        const reason = prompt("Reason for voiding this sale?");
+        if (reason === null) return; // cancelled, do nothing
+        const res2 = await fetch("/api/sales/void", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sale_id: s.id, reason }),
+        });
+        if (res2.ok) {
+          await loadSalesHistory();
+          await loadReports();
+          await loadProducts();
+        } else {
+          const errData = await res2.json();
+          alert(errData.error);
+        }
+      });
+      row.appendChild(voidBtn);
+    }
+    container.appendChild(row);
+  });
+}
+
+async function loadBusinessSettings() {
+  const res = await fetch("/api/business-profile");
+  const data = await res.json();
+  const p = data.profile;
+  if (!p) return; // nothing saved yet, leave the form blank
+  document.getElementById("bizLegalName").value = p.legal_name || "";
+  document.getElementById("bizTradingName").value = p.trading_name || "";
+  document.getElementById("bizSsm").value = p.ssm_registration_no || "";
+  document.getElementById("bizTin").value = p.tin || "";
+  document.getElementById("bizSst").value = p.sst_registration_no || "";
+  document.getElementById("bizMsic").value = p.msic_code || "";
+  document.getElementById("bizPhone").value = p.phone || "";
+  document.getElementById("bizEmail").value = p.email || "";
+  document.getElementById("bizAddress1").value = p.address_line1 || "";
+  document.getElementById("bizCity").value = p.city || "";
+  document.getElementById("bizState").value = p.state || "";
+  document.getElementById("bizPostcode").value = p.postcode || "";
+}
+
+document.getElementById("saveBusinessBtn").addEventListener("click", async () => {
+  const msg = document.getElementById("saveBusinessMsg");
+  msg.textContent = "";
+
+  const body = {
+    legal_name: document.getElementById("bizLegalName").value.trim(),
+    trading_name: document.getElementById("bizTradingName").value.trim() || undefined,
+    ssm_registration_no: document.getElementById("bizSsm").value.trim(),
+    tin: document.getElementById("bizTin").value.trim(),
+    sst_registration_no: document.getElementById("bizSst").value.trim() || undefined,
+    msic_code: document.getElementById("bizMsic").value.trim() || undefined,
+    phone: document.getElementById("bizPhone").value.trim() || undefined,
+    email: document.getElementById("bizEmail").value.trim() || undefined,
+    address_line1: document.getElementById("bizAddress1").value.trim() || undefined,
+    city: document.getElementById("bizCity").value.trim() || undefined,
+    state: document.getElementById("bizState").value.trim() || undefined,
+    postcode: document.getElementById("bizPostcode").value.trim() || undefined,
+  };
+
+  const res = await fetch("/api/business-profile", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+
+  if (!res.ok) {
+    msg.textContent = data.error;
+    msg.className = "error";
+    return;
+  }
+
+  msg.textContent = "Business details saved.";
+  msg.className = "success";
+});
+
+async function loadDevices() {
+  const res = await fetch("/api/devices");
+  const data = await res.json();
+  const container = document.getElementById("deviceList");
+  container.innerHTML = "";
+
+  if (!data.devices || data.devices.length === 0) {
+    container.innerHTML = '<p class="sub">No trusted devices yet.</p>';
+    return;
+  }
+
+  data.devices.forEach((d) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const status = d.is_active ? "" : " (revoked)";
+    row.innerHTML =
+      "<span>" + d.device_name + status + "</span><span>Verified by " + d.verified_by_name + "</span>";
+
+    if (d.is_active) {
+      const revokeBtn = document.createElement("button");
+      revokeBtn.textContent = "Revoke";
+      revokeBtn.className = "smallBtn";
+      revokeBtn.addEventListener("click", async () => {
+        if (!confirm("Revoke trust for " + d.device_name + "? It will need full email verification again.")) return;
+        const res2 = await fetch("/api/devices/revoke", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ device_id: d.id }),
+        });
+        if (res2.ok) await loadDevices();
+      });
+      row.appendChild(revokeBtn);
+    }
+    container.appendChild(row);
+  });
+}
+
+async function loadAuditLog() {
+  const res = await fetch("/api/audit-log");
+  const data = await res.json();
+  const container = document.getElementById("auditLogList");
+  container.innerHTML = "";
+
+  if (!data.logs || data.logs.length === 0) {
+    container.innerHTML = '<p class="sub">No activity recorded yet.</p>';
+    return;
+  }
+
+  data.logs.forEach((l) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const who = l.user_name || "System";
+    row.innerHTML = "<span>" + l.action + " -- " + who + "</span><span>" + l.created_at + "</span>";
+    container.appendChild(row);
+  });
+}
 
 checkDeviceStatus();
 </script>
