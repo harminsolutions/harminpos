@@ -126,6 +126,10 @@ export default {
         return handleRemoveProduct(request, env);
       }
 
+      if (request.method === "POST" && url.pathname === "/api/products/edit") {
+        return handleEditProduct(request, env);
+      }
+
       if (request.method === "GET" && url.pathname === "/api/suppliers") {
         return handleListSuppliers(request, env);
       }
@@ -144,6 +148,14 @@ export default {
 
       if (request.method === "POST" && url.pathname === "/api/users/deactivate") {
         return handleDeactivateUser(request, env);
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/users/reset-pin") {
+        return handleResetPin(request, env);
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/reports/employees") {
+        return handleEmployeePerformance(request, env);
       }
 
       if (request.method === "GET" && url.pathname === "/api/sales") {
@@ -608,11 +620,15 @@ async function handleListProducts(request, env) {
   // No role restriction here -- cashiers need to see products to sell
   // them at checkout, same as everyone else.
   const { results } = await env.DB.prepare(
-    `SELECT id, sku, name, item_type, unit_price, unit_of_measure, stock_quantity, reorder_level, sst_applicable, sst_rate
+    `SELECT id, sku, name, item_type, unit_price, cost_price, unit_of_measure, stock_quantity, reorder_level, sst_applicable, sst_rate, supplier_id
      FROM products WHERE is_active = 1 ORDER BY name`
   ).all();
 
-  const products = results.map((p) => ({ ...p, unit_price_display: senToRinggit(p.unit_price) }));
+  const products = results.map((p) => ({
+    ...p,
+    unit_price_display: senToRinggit(p.unit_price),
+    cost_price_display: p.cost_price !== null ? senToRinggit(p.cost_price) : "",
+  }));
   return jsonResponse({ products });
 }
 
@@ -687,13 +703,18 @@ async function handleCreateSale(request, env) {
   }
 
   const body = await request.json();
-  const { items, payment_method, customer_id } = body;
+  const { items, payment_method, customer_id, discount_amount } = body;
 
   if (!Array.isArray(items) || items.length === 0) {
     return jsonResponse({ error: "Cart is empty." }, 400);
   }
   if (!["cash", "duitnow_qr", "card", "other"].includes(payment_method)) {
     return jsonResponse({ error: "Select a valid payment method." }, 400);
+  }
+
+  const discountSen = discount_amount ? ringgitToSen(discount_amount) : 0;
+  if (discountSen === null || discountSen < 0) {
+    return jsonResponse({ error: "Enter a valid discount amount." }, 400);
   }
 
   // Load and validate every product BEFORE writing anything, so a bad item
@@ -741,7 +762,10 @@ async function handleCreateSale(request, env) {
     });
   }
 
-  const totalAmount = subtotal + sstAmount;
+  const totalAmount = subtotal + sstAmount - discountSen;
+  if (totalAmount < 0) {
+    return jsonResponse({ error: "Discount can't be more than the order total." }, 400);
+  }
 
   // Sequential, human-readable receipt number -- e.g. INV-000001.
   const countRow = await env.DB.prepare("SELECT COUNT(*) as count FROM sales").first();
@@ -753,7 +777,7 @@ async function handleCreateSale(request, env) {
   // later just changes this one line, not the rest of the checkout flow.
   const saleResult = await env.DB.prepare(
     `INSERT INTO sales (receipt_number, cashier_id, shift_id, customer_id, subtotal, sst_amount, discount_amount, total_amount, payment_method, payment_status, einvoice_status, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, 'completed', 'not_required', ?)`
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'completed', 'not_required', ?)`
   )
     .bind(
       receiptNumber,
@@ -762,6 +786,7 @@ async function handleCreateSale(request, env) {
       customer_id || null,
       subtotal,
       sstAmount,
+      discountSen,
       totalAmount,
       payment_method,
       now
@@ -798,6 +823,7 @@ async function handleCreateSale(request, env) {
       receipt_number: receiptNumber,
       subtotal: senToRinggit(subtotal),
       sst_amount: senToRinggit(sstAmount),
+      discount_amount: senToRinggit(discountSen),
       total_amount: senToRinggit(totalAmount),
       payment_method,
       items: lineItems.map((li) => ({
@@ -924,6 +950,23 @@ async function handleCurrentShift(request, env) {
   return jsonResponse({ open: true, shift_id: shift.id, opening_cash: senToRinggit(shift.opening_cash) });
 }
 
+// Shared by reports and employee performance -- "today" resets at UTC
+// midnight, which can run up to 8 hours behind Malaysia time, while
+// "week"/"month" are simple rolling windows rather than exact calendar
+// boundaries. Good enough for a first version of range reporting.
+function getRangeStart(range) {
+  const now = new Date();
+  if (range === "week") {
+    return new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  }
+  if (range === "month") {
+    return new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  }
+  const todayStart = new Date(now);
+  todayStart.setUTCHours(0, 0, 0, 0);
+  return todayStart.toISOString();
+}
+
 async function handleReportsSummary(request, env) {
   const currentUser = await getCurrentUser(request, env);
   if (!currentUser) {
@@ -933,17 +976,14 @@ async function handleReportsSummary(request, env) {
     return jsonResponse({ error: "You don't have permission to view reports." }, 403);
   }
 
-  // "Today" is calculated in UTC here, which can run up to 8 hours behind
-  // Malaysia time -- close enough for a first version, but worth knowing
-  // if a late-night sale ever looks like it landed on the wrong day.
-  const todayStart = new Date();
-  todayStart.setUTCHours(0, 0, 0, 0);
-  const todayStartIso = todayStart.toISOString();
+  const url = new URL(request.url);
+  const range = url.searchParams.get("range") || "today";
+  const startIso = getRangeStart(range);
 
   const salesRow = await env.DB.prepare(
     "SELECT COUNT(*) as sale_count, COALESCE(SUM(total_amount), 0) as revenue FROM sales WHERE is_voided = 0 AND created_at >= ?"
   )
-    .bind(todayStartIso)
+    .bind(startIso)
     .first();
 
   const profitRow = await env.DB.prepare(
@@ -952,14 +992,45 @@ async function handleReportsSummary(request, env) {
      JOIN sales s ON s.id = si.sale_id
      WHERE s.is_voided = 0 AND s.created_at >= ?`
   )
-    .bind(todayStartIso)
+    .bind(startIso)
     .first();
 
   return jsonResponse({
+    range,
     sale_count: salesRow.sale_count,
     revenue: senToRinggit(salesRow.revenue),
     profit: senToRinggit(profitRow.profit),
   });
+}
+
+async function handleEmployeePerformance(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to view this." }, 403);
+  }
+
+  const url = new URL(request.url);
+  const range = url.searchParams.get("range") || "today";
+  const startIso = getRangeStart(range);
+
+  const { results } = await env.DB.prepare(
+    `SELECT u.name,
+            SUM(CASE WHEN s.is_voided = 0 THEN 1 ELSE 0 END) as sale_count,
+            COALESCE(SUM(CASE WHEN s.is_voided = 0 THEN s.total_amount ELSE 0 END), 0) as revenue,
+            SUM(CASE WHEN s.is_voided = 1 THEN 1 ELSE 0 END) as void_count
+     FROM sales s JOIN users u ON u.id = s.cashier_id
+     WHERE s.created_at >= ?
+     GROUP BY s.cashier_id
+     ORDER BY revenue DESC`
+  )
+    .bind(startIso)
+    .all();
+
+  const performance = results.map((r) => ({ ...r, revenue_display: senToRinggit(r.revenue) }));
+  return jsonResponse({ performance });
 }
 
 async function handleRemoveProduct(request, env) {
@@ -988,6 +1059,82 @@ async function handleRemoveProduct(request, env) {
 
   await env.DB.prepare(
     "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'product_removed', 'product', ?)"
+  )
+    .bind(currentUser.id, product_id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleEditProduct(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin", "staff"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage products." }, 403);
+  }
+
+  const body = await request.json();
+  const { product_id, name, item_type, unit_price, cost_price, sku, stock_quantity, sst_applicable, sst_rate, supplier_id } =
+    body;
+
+  if (!product_id) {
+    return jsonResponse({ error: "Missing product." }, 400);
+  }
+
+  const existing = await env.DB.prepare("SELECT id FROM products WHERE id = ?").bind(product_id).first();
+  if (!existing) {
+    return jsonResponse({ error: "Product not found." }, 404);
+  }
+
+  if (!name || !item_type || unit_price === undefined || unit_price === null || unit_price === "") {
+    return jsonResponse({ error: "Name, type, and price are required." }, 400);
+  }
+  if (!["goods", "service"].includes(item_type)) {
+    return jsonResponse({ error: "Item type must be goods or service." }, 400);
+  }
+
+  const priceSen = ringgitToSen(unit_price);
+  if (priceSen === null || priceSen < 0) {
+    return jsonResponse({ error: "Enter a valid price." }, 400);
+  }
+  const costSen = cost_price !== undefined && cost_price !== "" ? ringgitToSen(cost_price) : null;
+
+  if (sku) {
+    const skuClash = await env.DB.prepare("SELECT id FROM products WHERE sku = ? AND id != ?")
+      .bind(sku, product_id)
+      .first();
+    if (skuClash) {
+      return jsonResponse({ error: "That SKU is already used by another product." }, 400);
+    }
+  }
+
+  const stockValue = item_type === "goods" ? Number(stock_quantity) || 0 : null;
+  const sstApplicable = sst_applicable ? 1 : 0;
+  const sstRateValue = sstApplicable ? Number(sst_rate) || 0 : null;
+
+  await env.DB.prepare(
+    `UPDATE products SET name=?, item_type=?, unit_price=?, cost_price=?, sku=?, stock_quantity=?, sst_applicable=?, sst_rate=?, supplier_id=?, updated_at=?
+     WHERE id = ?`
+  )
+    .bind(
+      name,
+      item_type,
+      priceSen,
+      costSen,
+      sku || null,
+      stockValue,
+      sstApplicable,
+      sstRateValue,
+      supplier_id || null,
+      new Date().toISOString(),
+      product_id
+    )
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'product_edited', 'product', ?)"
   )
     .bind(currentUser.id, product_id)
     .run();
@@ -1135,6 +1282,52 @@ async function handleDeactivateUser(request, env) {
 
   await env.DB.prepare(
     "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'user_deactivated', 'user', ?)"
+  )
+    .bind(currentUser.id, user_id)
+    .run();
+
+  return jsonResponse({ success: true });
+}
+
+async function handleResetPin(request, env) {
+  const currentUser = await getCurrentUser(request, env);
+  if (!currentUser) {
+    return jsonResponse({ error: "Not logged in." }, 401);
+  }
+  if (!["owner", "admin"].includes(currentUser.role)) {
+    return jsonResponse({ error: "You don't have permission to manage staff." }, 403);
+  }
+
+  const { user_id } = await request.json();
+  if (!user_id) {
+    return jsonResponse({ error: "Missing account." }, 400);
+  }
+  if (Number(user_id) === currentUser.id) {
+    return jsonResponse({ error: "Use Set your PIN to change your own PIN." }, 400);
+  }
+
+  const target = await env.DB.prepare("SELECT id, role FROM users WHERE id = ?").bind(user_id).first();
+  if (!target) {
+    return jsonResponse({ error: "Account not found." }, 404);
+  }
+  if (target.role === "owner") {
+    return jsonResponse({ error: "The owner's PIN can't be reset this way." }, 400);
+  }
+  if (target.role === "admin" && currentUser.role !== "owner") {
+    return jsonResponse({ error: "Only the owner can reset an admin's PIN." }, 403);
+  }
+
+  // Clear the PIN entirely rather than setting a new one -- the owner/admin
+  // never learns anyone else's PIN this way. The person just re-authenticates
+  // with their password next time and sets a fresh PIN themselves.
+  await env.DB.prepare(
+    "UPDATE users SET pin_hash = NULL, pin_failed_attempts = 0, pin_locked_until = NULL WHERE id = ?"
+  )
+    .bind(user_id)
+    .run();
+
+  await env.DB.prepare(
+    "INSERT INTO audit_log (user_id, action, entity_type, entity_id) VALUES (?, 'pin_reset', 'user', ?)"
   )
     .bind(currentUser.id, user_id)
     .run();
@@ -1420,6 +1613,7 @@ const HTML_PAGE = `<!DOCTYPE html>
   .productRow { display: flex; justify-content: space-between; gap: 16px; padding: 10px 0; border-bottom: 1px solid var(--paper-edge); font-size: 14px; }
   .productRow span:first-child { flex: 1; }
   .productRow span { color: var(--text); }
+  .lowStock { color: var(--danger) !important; font-weight: 600; }
   .totalRow { font-weight: 700; }
 
   /* Auth screens keep a narrow, centered card feel */
@@ -1581,6 +1775,8 @@ const HTML_PAGE = `<!DOCTYPE html>
         <div class="order-header">Current Order</div>
         <div id="cartItems" class="order-items"></div>
         <div id="cartTotals" class="order-totals"></div>
+        <label for="discountInput">Discount (RM, optional)</label>
+        <input id="discountInput" type="number" step="0.01" min="0" placeholder="0.00" />
         <label for="paymentMethod">Payment method</label>
         <select id="paymentMethod">
           <option value="cash">Cash</option>
@@ -1616,7 +1812,10 @@ const HTML_PAGE = `<!DOCTYPE html>
       <div id="addSupplierMsg"></div>
 
       <div id="addProductSection">
-        <h2 class="sectionTitle">Add a product</h2>
+        <h2 class="sectionTitle" id="productFormTitle">Add a product</h2>
+        <p class="toggle" id="cancelEditRow" style="display: none; text-align: left; margin-top: 0;">
+          <a id="cancelEditBtn">Cancel editing</a>
+        </p>
         <label for="prodName">Name</label>
         <input id="prodName" type="text" />
         <label for="prodType">Type</label>
@@ -1649,10 +1848,18 @@ const HTML_PAGE = `<!DOCTYPE html>
     </div>
 
     <div id="reportsTab" class="padded-panel">
-      <h2 class="sectionTitle" style="margin-top: 0;">Today</h2>
+      <div style="display: flex; gap: 8px; margin-bottom: 16px;">
+        <button id="rangeTodayBtn" class="smallBtn" style="margin: 0;">Today</button>
+        <button id="rangeWeekBtn" class="smallBtn" style="margin: 0;">7 days</button>
+        <button id="rangeMonthBtn" class="smallBtn" style="margin: 0;">30 days</button>
+      </div>
+      <h2 class="sectionTitle" style="margin-top: 0;" id="reportRangeTitle">Today</h2>
       <div class="productRow"><span>Sales</span><span id="reportSaleCount"></span></div>
       <div class="productRow"><span>Revenue</span><span id="reportRevenue"></span></div>
       <div class="productRow totalRow"><span>Profit</span><span id="reportProfit"></span></div>
+
+      <h2 class="sectionTitle">By employee</h2>
+      <div id="employeePerformanceList"></div>
 
       <h2 class="sectionTitle">Recent sales</h2>
       <div id="salesHistoryList"></div>
@@ -1990,6 +2197,7 @@ document.getElementById("usePasswordInstead").addEventListener("click", () => sh
 
 let allSuppliers = [];
 let currentUserRole = null;
+let editingProductId = null;
 
 async function loadDashboard() {
   const me = await fetch("/api/me").then((r) => r.json());
@@ -2039,14 +2247,18 @@ function renderCheckoutProductList() {
   visible.forEach((p) => {
     const card = document.createElement("button");
     card.className = "product-card";
+    const lowStock = p.item_type === "goods" && p.reorder_level !== null && p.stock_quantity <= p.reorder_level;
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
     card.innerHTML =
       '<div class="p-name">' +
       p.name +
       '</div><div class="p-price">RM ' +
       p.unit_price_display +
-      '</div><div class="p-meta">' +
+      '</div><div class="p-meta' +
+      (lowStock ? " lowStock" : "") +
+      '">' +
       stockText +
+      (lowStock ? " -- Low stock" : "") +
       "</div>";
     card.addEventListener("click", () => addToCart(p));
     container.appendChild(card);
@@ -2067,9 +2279,19 @@ function renderManageProductList() {
   allProducts.forEach((p) => {
     const row = document.createElement("div");
     row.className = "productRow";
+    const lowStock = p.item_type === "goods" && p.reorder_level !== null && p.stock_quantity <= p.reorder_level;
     const stockText = p.item_type === "goods" ? "Stock: " + (p.stock_quantity ?? 0) : "Service";
     row.innerHTML =
-      "<span>" + p.name + "</span><span>RM " + p.unit_price_display + "</span><span>" + stockText + "</span>";
+      "<span>" +
+      p.name +
+      "</span><span>RM " +
+      p.unit_price_display +
+      '</span><span class="' +
+      (lowStock ? "lowStock" : "") +
+      '">' +
+      stockText +
+      (lowStock ? " -- Low stock" : "") +
+      "</span>";
     const removeBtn = document.createElement("button");
     removeBtn.textContent = "Remove";
     removeBtn.className = "smallBtn";
@@ -2084,6 +2306,11 @@ function renderManageProductList() {
         await loadProducts();
       }
     });
+    const editBtn = document.createElement("button");
+    editBtn.textContent = "Edit";
+    editBtn.className = "smallBtn";
+    editBtn.addEventListener("click", () => startEditingProduct(p));
+    row.appendChild(editBtn);
     row.appendChild(removeBtn);
     container.appendChild(row);
   });
@@ -2096,6 +2323,45 @@ document.getElementById("prodType").addEventListener("change", (e) => {
 document.getElementById("prodSstApplicable").addEventListener("change", (e) => {
   document.getElementById("sstRateField").style.display = e.target.checked ? "block" : "none";
 });
+
+function startEditingProduct(p) {
+  editingProductId = p.id;
+  document.getElementById("productFormTitle").textContent = "Edit product";
+  document.getElementById("addProductBtn").textContent = "Save changes";
+  document.getElementById("cancelEditRow").style.display = "block";
+
+  document.getElementById("prodName").value = p.name;
+  document.getElementById("prodType").value = p.item_type;
+  document.getElementById("stockFields").style.display = p.item_type === "goods" ? "block" : "none";
+  document.getElementById("prodPrice").value = p.unit_price_display;
+  document.getElementById("prodCost").value = p.cost_price_display || "";
+  document.getElementById("prodSku").value = p.sku || "";
+  document.getElementById("prodStock").value = p.stock_quantity ?? "";
+  document.getElementById("prodSstApplicable").checked = !!p.sst_applicable;
+  document.getElementById("sstRateField").style.display = p.sst_applicable ? "block" : "none";
+  document.getElementById("prodSstRate").value = p.sst_applicable ? (p.sst_rate * 100).toFixed(2) : "";
+  document.getElementById("prodSupplier").value = p.supplier_id || "";
+
+  document.getElementById("productFormTitle").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+
+function resetProductForm() {
+  editingProductId = null;
+  document.getElementById("productFormTitle").textContent = "Add a product";
+  document.getElementById("addProductBtn").textContent = "Add product";
+  document.getElementById("cancelEditRow").style.display = "none";
+  document.getElementById("prodName").value = "";
+  document.getElementById("prodPrice").value = "";
+  document.getElementById("prodCost").value = "";
+  document.getElementById("prodSku").value = "";
+  document.getElementById("prodStock").value = "";
+  document.getElementById("prodSstApplicable").checked = false;
+  document.getElementById("prodSstRate").value = "";
+  document.getElementById("sstRateField").style.display = "none";
+  document.getElementById("prodSupplier").value = "";
+}
+
+document.getElementById("cancelEditBtn").addEventListener("click", resetProductForm);
 
 document.getElementById("addProductBtn").addEventListener("click", async () => {
   const name = document.getElementById("prodName").value.trim();
@@ -2110,20 +2376,25 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
   const msg = document.getElementById("addProductMsg");
   msg.textContent = "";
 
-  const res = await fetch("/api/products", {
+  const payload = {
+    name,
+    item_type,
+    unit_price,
+    cost_price: cost_price || undefined,
+    sku: sku || undefined,
+    stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
+    sst_applicable: sstApplicable,
+    sst_rate: sstApplicable ? Number(sstRatePercent || 0) / 100 : undefined,
+    supplier_id: supplier_id || undefined,
+  };
+
+  const isEditing = editingProductId !== null;
+  if (isEditing) payload.product_id = editingProductId;
+
+  const res = await fetch(isEditing ? "/api/products/edit" : "/api/products", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      name,
-      item_type,
-      unit_price,
-      cost_price: cost_price || undefined,
-      sku: sku || undefined,
-      stock_quantity: item_type === "goods" ? Number(stock_quantity || 0) : undefined,
-      sst_applicable: sstApplicable,
-      sst_rate: sstApplicable ? Number(sstRatePercent || 0) / 100 : undefined,
-      supplier_id: supplier_id || undefined,
-    }),
+    body: JSON.stringify(payload),
   });
   const data = await res.json();
 
@@ -2133,16 +2404,9 @@ document.getElementById("addProductBtn").addEventListener("click", async () => {
     return;
   }
 
-  msg.textContent = "Product added!";
+  msg.textContent = isEditing ? "Product updated!" : "Product added!";
   msg.className = "success";
-  document.getElementById("prodName").value = "";
-  document.getElementById("prodPrice").value = "";
-  document.getElementById("prodCost").value = "";
-  document.getElementById("prodSku").value = "";
-  document.getElementById("prodStock").value = "";
-  document.getElementById("prodSstApplicable").checked = false;
-  document.getElementById("prodSstRate").value = "";
-  document.getElementById("sstRateField").style.display = "none";
+  resetProductForm();
   await loadProducts();
 });
 
@@ -2203,16 +2467,21 @@ function renderCart() {
     container.appendChild(row);
   });
 
-  const total = subtotal + sstTotal;
+  const discount = Number(document.getElementById("discountInput").value) || 0;
+  const total = Math.max(0, subtotal + sstTotal - discount);
   document.getElementById("cartTotals").innerHTML =
     '<div class="totalLine"><span>Subtotal</span><span>RM ' +
     subtotal.toFixed(2) +
     '</span></div><div class="totalLine"><span>SST</span><span>RM ' +
     sstTotal.toFixed(2) +
+    '</span></div><div class="totalLine"><span>Discount</span><span>-RM ' +
+    discount.toFixed(2) +
     '</span></div><div class="grandTotal"><span>Total</span><span>RM ' +
     total.toFixed(2) +
     "</span></div>";
 }
+
+document.getElementById("discountInput").addEventListener("input", renderCart);
 
 document.getElementById("checkoutBtn").addEventListener("click", async () => {
   const msg = document.getElementById("checkoutMsg");
@@ -2225,6 +2494,7 @@ document.getElementById("checkoutBtn").addEventListener("click", async () => {
   }
 
   const payment_method = document.getElementById("paymentMethod").value;
+  const discount_amount = document.getElementById("discountInput").value || undefined;
 
   const res = await fetch("/api/sales", {
     method: "POST",
@@ -2232,6 +2502,7 @@ document.getElementById("checkoutBtn").addEventListener("click", async () => {
     body: JSON.stringify({
       items: cart.map((c) => ({ product_id: c.product_id, quantity: c.quantity })),
       payment_method,
+      discount_amount,
     }),
   });
   const data = await res.json();
@@ -2243,6 +2514,7 @@ document.getElementById("checkoutBtn").addEventListener("click", async () => {
   }
 
   cart = [];
+  document.getElementById("discountInput").value = "";
   renderCart();
   showReceipt(data.sale);
   await loadProducts(); // stock counts just changed, refresh the list
@@ -2257,6 +2529,12 @@ function showReceipt(sale) {
     row.innerHTML = "<span>" + item.name + " x" + item.quantity + "</span><span>RM " + item.line_total + "</span>";
     container.appendChild(row);
   });
+  if (Number(sale.discount_amount) > 0) {
+    const discountRow = document.createElement("div");
+    discountRow.className = "productRow";
+    discountRow.innerHTML = "<span>Discount</span><span>-RM " + sale.discount_amount + "</span>";
+    container.appendChild(discountRow);
+  }
   document.getElementById("receiptNumber").textContent = sale.receipt_number;
   document.getElementById("receiptTotal").textContent = "RM " + sale.total_amount;
   document.getElementById("receiptSection").style.display = "block";
@@ -2335,14 +2613,67 @@ document.getElementById("confirmCloseShiftBtn").addEventListener("click", async 
   await loadShiftStatus();
 });
 
+let currentReportRange = "today";
+
 async function loadReports() {
-  const res = await fetch("/api/reports/summary");
+  const res = await fetch("/api/reports/summary?range=" + currentReportRange);
   const data = await res.json();
   if (!res.ok) return;
   document.getElementById("reportSaleCount").textContent = data.sale_count;
   document.getElementById("reportRevenue").textContent = "RM " + data.revenue;
   document.getElementById("reportProfit").textContent = "RM " + data.profit;
+
+  const titles = { today: "Today", week: "Last 7 days", month: "Last 30 days" };
+  document.getElementById("reportRangeTitle").textContent = titles[currentReportRange];
+
+  ["rangeTodayBtn", "rangeWeekBtn", "rangeMonthBtn"].forEach((id) => {
+    document.getElementById(id).style.background = "white";
+    document.getElementById(id).style.color = "var(--ink)";
+  });
+  const activeId = { today: "rangeTodayBtn", week: "rangeWeekBtn", month: "rangeMonthBtn" }[currentReportRange];
+  document.getElementById(activeId).style.background = "var(--ink)";
+  document.getElementById(activeId).style.color = "white";
+
+  await loadEmployeePerformance();
 }
+
+async function loadEmployeePerformance() {
+  const res = await fetch("/api/reports/employees?range=" + currentReportRange);
+  const data = await res.json();
+  const container = document.getElementById("employeePerformanceList");
+  container.innerHTML = "";
+
+  if (!res.ok) {
+    container.innerHTML = ""; // staff role: not permitted, just show nothing
+    return;
+  }
+  if (!data.performance || data.performance.length === 0) {
+    container.innerHTML = '<p class="sub">No sales in this period yet.</p>';
+    return;
+  }
+
+  data.performance.forEach((p) => {
+    const row = document.createElement("div");
+    row.className = "productRow";
+    const voidNote = p.void_count > 0 ? ", " + p.void_count + " voided" : "";
+    row.innerHTML =
+      "<span>" + p.name + "</span><span>" + p.sale_count + " sales" + voidNote + "</span><span>RM " + p.revenue_display + "</span>";
+    container.appendChild(row);
+  });
+}
+
+document.getElementById("rangeTodayBtn").addEventListener("click", () => {
+  currentReportRange = "today";
+  loadReports();
+});
+document.getElementById("rangeWeekBtn").addEventListener("click", () => {
+  currentReportRange = "week";
+  loadReports();
+});
+document.getElementById("rangeMonthBtn").addEventListener("click", () => {
+  currentReportRange = "month";
+  loadReports();
+});
 
 async function loadSuppliers() {
   const res = await fetch("/api/suppliers");
@@ -2444,6 +2775,23 @@ async function loadStaffTab() {
     row.className = "productRow";
     row.innerHTML = "<span>" + u.name + "</span><span>" + u.email + "</span><span>" + u.role + "</span>";
     if (u.role !== "owner") {
+      const resetPinBtn = document.createElement("button");
+      resetPinBtn.textContent = "Reset PIN";
+      resetPinBtn.className = "smallBtn";
+      resetPinBtn.addEventListener("click", async () => {
+        if (!confirm("Reset " + u.name + "'s PIN? They'll need to log in with their password and set a new one.")) return;
+        const res2 = await fetch("/api/users/reset-pin", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ user_id: u.id }),
+        });
+        if (!res2.ok) {
+          const errData = await res2.json();
+          alert(errData.error);
+        }
+      });
+      row.appendChild(resetPinBtn);
+
       const deactivateBtn = document.createElement("button");
       deactivateBtn.textContent = "Deactivate";
       deactivateBtn.className = "smallBtn";
